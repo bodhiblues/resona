@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/NimbleMarkets/ntcharts/barchart"
+	"github.com/NimbleMarkets/ntcharts/linechart/wavelinechart"
+	"github.com/NimbleMarkets/ntcharts/canvas"
+	"github.com/NimbleMarkets/ntcharts/canvas/runes"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -61,6 +64,7 @@ type model struct {
 	radioWasPaused    bool
 	// Visualizer
 	visualizer        barchart.Model
+	currentChartType  string // "unicode", "bars", "line", "wave", "sparkline", "heatmap"
 }
 
 
@@ -127,6 +131,7 @@ func initialModel() model {
 		controlSelected:   1, // Start with play/pause selected
 		spinner:           s,
 		visualizer:        visualizer,
+		currentChartType:  "unicode", // Start with the high-res unicode visualizer
 	}
 	
 	// Reset viewport to ensure proper initial display
@@ -355,6 +360,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentView = "radio"
 				m.selected = 0
 			} else if m.currentView == "radio" {
+				m.currentView = "visualizer"
+				m.selected = 0
+			} else if m.currentView == "visualizer" {
 				m.currentView = "settings"
 				m.selected = 0
 			} else if m.currentView == "settings" {
@@ -417,6 +425,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.folderBrowser.MoveUp()
 			} else if m.currentView == "radio" {
 				m.radioBrowser.MoveUp()
+			} else if m.currentView == "visualizer" {
+				// No up/down navigation needed for visualizer
 			} else if m.currentView == "settings" {
 				m.settingsBrowser.MoveUp()
 			}
@@ -430,6 +440,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.folderBrowser.MoveDown()
 			} else if m.currentView == "radio" {
 				m.radioBrowser.MoveDown()
+			} else if m.currentView == "visualizer" {
+				// No up/down navigation needed for visualizer
 			} else if m.currentView == "settings" {
 				m.settingsBrowser.MoveDown()
 			}
@@ -439,12 +451,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.controlSelected > 0 {
 					m.controlSelected--
 				}
+			} else if m.currentView == "visualizer" {
+				// Switch to previous chart type
+				chartTypes := []string{"unicode", "bars", "line", "wave"}
+				currentIndex := 0
+				for i, chartType := range chartTypes {
+					if chartType == m.currentChartType {
+						currentIndex = i
+						break
+					}
+				}
+				if currentIndex > 0 {
+					m.currentChartType = chartTypes[currentIndex-1]
+				} else {
+					m.currentChartType = chartTypes[len(chartTypes)-1] // Wrap to last
+				}
 			}
 			return m, nil
 		case "right", "l":
 			if m.nowPlayingFocused {
 				if m.controlSelected < 3 {
 					m.controlSelected++
+				}
+			} else if m.currentView == "visualizer" {
+				// Switch to next chart type
+				chartTypes := []string{"unicode", "bars", "line", "wave"}
+				currentIndex := 0
+				for i, chartType := range chartTypes {
+					if chartType == m.currentChartType {
+						currentIndex = i
+						break
+					}
+				}
+				if currentIndex < len(chartTypes)-1 {
+					m.currentChartType = chartTypes[currentIndex+1]
+				} else {
+					m.currentChartType = chartTypes[0] // Wrap to first
 				}
 			}
 			return m, nil
@@ -472,6 +514,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.currentView == "radio" {
 				return m.handleRadioEnter()
+			} else if m.currentView == "visualizer" {
+				// No specific enter action needed for visualizer
 			} else if m.currentView == "settings" {
 				if err := m.settingsBrowser.EnterSelected(); err != nil {
 					// Handle error - could add error display
@@ -496,6 +540,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.radioBrowser.CancelQuickAdd()
 					}
 				}
+			} else if m.currentView == "visualizer" {
+				// No escape action needed for visualizer
 			} else if m.currentView == "settings" {
 				m.settingsBrowser.BackPressed()
 			}
@@ -507,6 +553,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.folderBrowser.GoBack()
 			} else if m.currentView == "radio" && m.radioBrowser.IsInputMode() {
 				m.radioBrowser.RemoveInputChar()
+			} else if m.currentView == "visualizer" {
+				// No backspace action needed for visualizer
 			}
 			return m, nil
 		default:
@@ -655,32 +703,43 @@ func (m model) renderTabs() string {
 	libraryTab := "Library"
 	filesTab := "Files"
 	radioTab := "Radio"
+	visualizerTab := "Visualizer"
 	settingsTab := "Settings"
 	
 	if m.currentView == "library" {
 		libraryTab = activeTabStyle.Render(libraryTab)
 		filesTab = inactiveTabStyle.Render(filesTab)
 		radioTab = inactiveTabStyle.Render(radioTab)
+		visualizerTab = inactiveTabStyle.Render(visualizerTab)
 		settingsTab = inactiveTabStyle.Render(settingsTab)
 	} else if m.currentView == "folder" {
 		libraryTab = inactiveTabStyle.Render(libraryTab)
 		filesTab = activeTabStyle.Render(filesTab)
 		radioTab = inactiveTabStyle.Render(radioTab)
+		visualizerTab = inactiveTabStyle.Render(visualizerTab)
 		settingsTab = inactiveTabStyle.Render(settingsTab)
 	} else if m.currentView == "radio" {
 		libraryTab = inactiveTabStyle.Render(libraryTab)
 		filesTab = inactiveTabStyle.Render(filesTab)
 		radioTab = activeTabStyle.Render(radioTab)
+		visualizerTab = inactiveTabStyle.Render(visualizerTab)
+		settingsTab = inactiveTabStyle.Render(settingsTab)
+	} else if m.currentView == "visualizer" {
+		libraryTab = inactiveTabStyle.Render(libraryTab)
+		filesTab = inactiveTabStyle.Render(filesTab)
+		radioTab = inactiveTabStyle.Render(radioTab)
+		visualizerTab = activeTabStyle.Render(visualizerTab)
 		settingsTab = inactiveTabStyle.Render(settingsTab)
 	} else if m.currentView == "settings" {
 		libraryTab = inactiveTabStyle.Render(libraryTab)
 		filesTab = inactiveTabStyle.Render(filesTab)
 		radioTab = inactiveTabStyle.Render(radioTab)
+		visualizerTab = inactiveTabStyle.Render(visualizerTab)
 		settingsTab = activeTabStyle.Render(settingsTab)
 	}
 	
 	// Join tabs with spacing
-	tabsLine := lipgloss.JoinHorizontal(lipgloss.Top, libraryTab, " ", filesTab, " ", radioTab, " ", settingsTab)
+	tabsLine := lipgloss.JoinHorizontal(lipgloss.Top, libraryTab, " ", filesTab, " ", radioTab, " ", visualizerTab, " ", settingsTab)
 	
 	return tabsLine
 }
@@ -695,6 +754,8 @@ func (m model) renderMainContent(availableHeight int) string {
 		rawContent = m.renderFolderBrowser()
 	case "radio":
 		rawContent = m.renderRadio()
+	case "visualizer":
+		rawContent = m.renderFullScreenVisualizer(availableHeight)
 	case "settings":
 		rawContent = m.renderSettings()
 	default:
@@ -2688,6 +2749,477 @@ func (m *model) renderVisualizer(width int) string {
 	
 	return strings.Join(bars, "")
 }
+
+// renderFullScreenVisualizer renders the full-screen music visualizer
+func (m model) renderFullScreenVisualizer(availableHeight int) string {
+	theme := m.settingsManager.GetTheme()
+	isPlaying := m.audioPlayer.IsPlaying()
+	
+	var content []string
+	
+	// Header with chart type indicator
+	headerStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.Primary)).
+		Bold(true).
+		Align(lipgloss.Center)
+	
+	title := "Music Visualizer"
+	if isPlaying {
+		if m.playingSong != nil {
+			title = fmt.Sprintf("♪ %s - %s", m.playingSong.Title, m.playingSong.Artist)
+		} else if m.playingStation != nil {
+			title = fmt.Sprintf("♪ %s", m.playingStation.Name)
+		}
+	} else {
+		title = "Music Visualizer (No audio playing)"
+	}
+	
+	// Add chart type indicator
+	chartTypeNames := map[string]string{
+		"unicode": "Unicode Blocks",
+		"bars":    "Bar Chart",
+		"line":    "Line Chart",
+		"wave":    "Wave Chart",
+	}
+	
+	chartName := chartTypeNames[m.currentChartType]
+	if chartName == "" {
+		chartName = "Unknown"
+	}
+	
+	content = append(content, headerStyle.Render(title))
+	content = append(content, lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.Muted)).
+		Align(lipgloss.Center).
+		Render(fmt.Sprintf("[ %s ] Use ← → to switch chart types", chartName)))
+	content = append(content, "")
+	
+	// Calculate available space for visualizer
+	// Reserve space for header (3 lines), controls (2 lines), and some padding
+	visualizerHeight := availableHeight - 5
+	
+	// Ensure minimum height
+	if visualizerHeight < 1 {
+		visualizerHeight = 1
+	}
+	
+	// Ensure maximum height for reasonable performance
+	if visualizerHeight > 20 {
+		visualizerHeight = 20
+	}
+	
+	// Calculate visualizer dimensions
+	visualizerWidth := m.width - 4
+	if visualizerWidth > 80 {
+		visualizerWidth = 80
+	}
+	if visualizerWidth < 20 {
+		visualizerWidth = 20
+	}
+	
+	// Get real audio samples from the audio player
+	audioSamples := m.audioPlayer.GetAudioSamples()
+	
+	// Render based on current chart type
+	var visualizerContent string
+	switch m.currentChartType {
+	case "unicode":
+		visualizerContent = m.renderUnicodeVisualizer(audioSamples, visualizerWidth, visualizerHeight, isPlaying, theme)
+	case "bars":
+		visualizerContent = m.renderBarChart(audioSamples, visualizerWidth, visualizerHeight, isPlaying, theme)
+	case "line":
+		visualizerContent = m.renderLineChart(audioSamples, visualizerWidth, visualizerHeight, isPlaying, theme)
+	case "wave":
+		visualizerContent = m.renderWaveChart(audioSamples, visualizerWidth, visualizerHeight, isPlaying, theme)
+	default:
+		visualizerContent = m.renderUnicodeVisualizer(audioSamples, visualizerWidth, visualizerHeight, isPlaying, theme)
+	}
+	
+	content = append(content, visualizerContent)
+	
+	// Add controls/info
+	controlsStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.Muted)).
+		Align(lipgloss.Center)
+	
+	var controlsText string
+	if isPlaying {
+		controlsText = "Press 'space' to pause • Press 'f' to switch tabs • Use ← → to switch chart types"
+	} else {
+		controlsText = "No audio playing • Press 'f' to switch tabs • Use ← → to switch chart types"
+	}
+	
+	content = append(content, "")
+	content = append(content, controlsStyle.Render(controlsText))
+	
+	return strings.Join(content, "\n")
+}
+
+// renderUnicodeVisualizer renders the high-resolution Unicode block visualizer
+func (m model) renderUnicodeVisualizer(audioSamples []float64, width, height int, isPlaying bool, theme Theme) string {
+	var content []string
+	
+	// Create high-resolution visualizer using Unicode block characters
+	blockChars := []string{" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
+	
+	for row := 0; row < height; row++ {
+		var bars []string
+		
+		for i := 0; i < width; i++ {
+			var amplitude float64
+			
+			if isPlaying && len(audioSamples) > 0 {
+				// Use interpolation for smoother visualization
+				sampleIndex := (i * len(audioSamples)) / width
+				if sampleIndex >= len(audioSamples) {
+					sampleIndex = len(audioSamples) - 1
+				}
+				
+				// Get base amplitude
+				amplitude = audioSamples[sampleIndex]
+				
+				// Add some neighboring samples for smoothing
+				if len(audioSamples) > 3 {
+					neighbors := 0
+					neighborSum := amplitude
+					
+					if sampleIndex > 0 {
+						neighborSum += audioSamples[sampleIndex-1]
+						neighbors++
+					}
+					if sampleIndex < len(audioSamples)-1 {
+						neighborSum += audioSamples[sampleIndex+1]
+						neighbors++
+					}
+					
+					amplitude = neighborSum / float64(neighbors+1)
+				}
+				
+				// Amplify the signal for better visualization
+				amplitude *= 4.5
+				if amplitude > 1.0 {
+					amplitude = 1.0
+				}
+				
+				// Add some sparkle effect for high frequencies
+				if i > width/2 && amplitude > 0.7 {
+					amplitude = math.Min(amplitude * 1.2, 1.0)
+				}
+			} else {
+				// Show minimal activity when not playing
+				amplitude = 0.02
+			}
+			
+			// Convert amplitude to total height in "sub-characters" (8 levels per row)
+			totalSubHeight := amplitude * float64(height * 8)
+			
+			// Calculate what should be shown in this row
+			rowStartHeight := float64((height - row - 1) * 8)
+			rowEndHeight := float64((height - row) * 8)
+			
+			var barChar string
+			if totalSubHeight <= rowStartHeight {
+				// Bar doesn't reach this row
+				barChar = " "
+			} else if totalSubHeight >= rowEndHeight {
+				// Bar fills this entire row
+				barChar = "█"
+			} else {
+				// Bar partially fills this row - calculate sub-character level
+				subLevel := int(totalSubHeight - rowStartHeight)
+				if subLevel > 8 {
+					subLevel = 8
+				}
+				if subLevel < 0 {
+					subLevel = 0
+				}
+				barChar = blockChars[subLevel]
+			}
+			
+			// Color the bar based on frequency range using theme colors
+			var style lipgloss.Style
+			intensity := amplitude
+			
+			if i < width/4 {
+				// Bass frequencies - use primary/error colors
+				if intensity > 0.7 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Error))
+				} else if intensity > 0.4 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+				} else {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+				}
+			} else if i < width/2 {
+				// Mid frequencies - use warning/success colors
+				if intensity > 0.7 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Warning))
+				} else if intensity > 0.4 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Success))
+				} else {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+				}
+			} else if i < 3*width/4 {
+				// High-mid frequencies - use secondary/primary colors
+				if intensity > 0.7 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary))
+				} else if intensity > 0.4 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+				} else {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+				}
+			} else {
+				// Treble frequencies - use highlight/primary colors
+				if intensity > 0.7 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Highlight))
+				} else if intensity > 0.4 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+				} else {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+				}
+			}
+			
+			bars = append(bars, style.Render(barChar))
+		}
+		
+		// Center the visualizer row
+		rowContent := strings.Join(bars, "")
+		paddingNeeded := (m.width - width) / 2
+		if paddingNeeded > 0 {
+			rowContent = strings.Repeat(" ", paddingNeeded) + rowContent
+		}
+		
+		content = append(content, rowContent)
+	}
+	
+	return strings.Join(content, "\n")
+}
+
+// renderBarChart renders audio data using ntcharts bar chart
+func (m model) renderBarChart(audioSamples []float64, width, height int, isPlaying bool, theme Theme) string {
+	if !isPlaying || len(audioSamples) == 0 {
+		// Create empty bar chart
+		bc := barchart.New(width, height)
+		bc.Draw()
+		chartView := bc.View()
+		
+		// Center the chart
+		return m.centerChartContent(chartView, width)
+	}
+	
+	// Create bar chart with audio data
+	bc := barchart.New(width, height)
+	
+	// Process audio samples into bar data
+	numBars := min(len(audioSamples), width/2) // Limit bars to fit
+	var barData []barchart.BarData
+	
+	for i := 0; i < numBars; i++ {
+		amplitude := audioSamples[i]
+		
+		// Amplify for better visualization
+		amplitude *= 100
+		if amplitude > 100 {
+			amplitude = 100
+		}
+		
+		// Color based on frequency range using theme colors
+		var style lipgloss.Style
+		if i < numBars/4 {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Error)) // Bass
+		} else if i < numBars/2 {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Warning)) // Mid
+		} else if i < 3*numBars/4 {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary)) // High-mid
+		} else {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Highlight)) // Treble
+		}
+		
+		barData = append(barData, barchart.BarData{
+			Label: fmt.Sprintf("%d", i),
+			Values: []barchart.BarValue{
+				{fmt.Sprintf("%.0f", amplitude), amplitude, style},
+			},
+		})
+	}
+	
+	bc.PushAll(barData)
+	bc.Draw()
+	
+	chartView := bc.View()
+	
+	// Center the chart
+	return m.centerChartContent(chartView, width)
+}
+
+// renderLineChart renders audio data using ntcharts line chart
+func (m model) renderLineChart(audioSamples []float64, width, height int, isPlaying bool, theme Theme) string {
+	if !isPlaying || len(audioSamples) == 0 {
+		// Return empty space
+		var content []string
+		for i := 0; i < height; i++ {
+			content = append(content, strings.Repeat(" ", width))
+		}
+		return strings.Join(content, "\n")
+	}
+	
+	// Create a simple line chart representation
+	var content []string
+	
+	// Process samples to fit width
+	processedSamples := make([]float64, width)
+	for i := 0; i < width; i++ {
+		sampleIndex := (i * len(audioSamples)) / width
+		if sampleIndex >= len(audioSamples) {
+			sampleIndex = len(audioSamples) - 1
+		}
+		processedSamples[i] = audioSamples[sampleIndex] * float64(height)
+	}
+	
+	// Create line visualization
+	for row := 0; row < height; row++ {
+		var line []string
+		for i := 0; i < width; i++ {
+			barHeight := int(processedSamples[i])
+			if barHeight >= (height - row) {
+				// Color based on position using theme colors
+				var style lipgloss.Style
+				if i < width/4 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Error)) // Bass
+				} else if i < width/2 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Warning)) // Mid
+				} else if i < 3*width/4 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary)) // High-mid
+				} else {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Highlight)) // Treble
+				}
+				line = append(line, style.Render("●"))
+			} else {
+				line = append(line, " ")
+			}
+		}
+		
+		// Center the line
+		lineContent := strings.Join(line, "")
+		paddingNeeded := (m.width - width) / 2
+		if paddingNeeded > 0 {
+			lineContent = strings.Repeat(" ", paddingNeeded) + lineContent
+		}
+		
+		content = append(content, lineContent)
+	}
+	
+	return strings.Join(content, "\n")
+}
+
+// renderWaveChart renders audio data using ntcharts wave chart
+func (m model) renderWaveChart(audioSamples []float64, width, height int, isPlaying bool, theme Theme) string {
+	if !isPlaying || len(audioSamples) == 0 {
+		// Create empty wave chart with Y-axis starting from 0
+		wlc := wavelinechart.New(width, height, 
+			wavelinechart.WithYRange(0, 1),
+			wavelinechart.WithStyles(runes.ArcLineStyle, lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))))
+		wlc.Draw()
+		chartView := wlc.View()
+		
+		// Center the chart
+		return m.centerChartContent(chartView, width)
+	}
+	
+	// Create wave chart with audio data, Y-axis starting from 0
+	wlc := wavelinechart.New(width, height, 
+		wavelinechart.WithYRange(0, 1),
+		wavelinechart.WithStyles(runes.ArcLineStyle, lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))))
+	
+	// To create a more wave-like appearance, we need to add more points for smoother curves
+	// Use interpolation to create additional points between samples
+	numPoints := min(len(audioSamples), width/2) // Use fewer samples but interpolate
+	
+	for i := 0; i < numPoints; i++ {
+		sampleIndex := (i * len(audioSamples)) / numPoints
+		if sampleIndex >= len(audioSamples) {
+			sampleIndex = len(audioSamples) - 1
+		}
+		
+		amplitude := audioSamples[sampleIndex]
+		
+		// Ensure amplitude is positive (since we're starting from 0)
+		if amplitude < 0 {
+			amplitude = -amplitude // Take absolute value
+		}
+		
+		// Smooth the amplitude with neighboring samples for wave-like appearance
+		if len(audioSamples) > 3 && sampleIndex > 0 && sampleIndex < len(audioSamples)-1 {
+			prevAmp := audioSamples[sampleIndex-1]
+			nextAmp := audioSamples[sampleIndex+1]
+			if prevAmp < 0 { prevAmp = -prevAmp }
+			if nextAmp < 0 { nextAmp = -nextAmp }
+			
+			// Apply smoothing
+			amplitude = (prevAmp * 0.25 + amplitude * 0.5 + nextAmp * 0.25)
+		}
+		
+		// Amplify for better visibility
+		amplitude *= 2.0
+		
+		// Clamp to range [0, 1]
+		if amplitude > 1.0 {
+			amplitude = 1.0
+		}
+		if amplitude < 0.0 {
+			amplitude = 0.0
+		}
+		
+		// Plot multiple points to create smoother wave curves
+		xPos := float64(i * width) / float64(numPoints)
+		wlc.Plot(canvas.Float64Point{xPos, amplitude})
+		
+		// Add interpolated points between samples for smoother curves
+		if i < numPoints-1 {
+			nextSampleIndex := ((i + 1) * len(audioSamples)) / numPoints
+			if nextSampleIndex < len(audioSamples) {
+				nextAmplitude := audioSamples[nextSampleIndex]
+				if nextAmplitude < 0 { nextAmplitude = -nextAmplitude }
+				nextAmplitude *= 2.0
+				if nextAmplitude > 1.0 { nextAmplitude = 1.0 }
+				
+				// Add intermediate points for smooth curves
+				for j := 1; j < 4; j++ {
+					interpFactor := float64(j) / 4.0
+					interpAmplitude := amplitude + (nextAmplitude - amplitude) * interpFactor
+					interpX := xPos + (float64(width) / float64(numPoints)) * interpFactor
+					wlc.Plot(canvas.Float64Point{interpX, interpAmplitude})
+				}
+			}
+		}
+	}
+	
+	wlc.Draw()
+	chartView := wlc.View()
+	
+	// Center the chart
+	return m.centerChartContent(chartView, width)
+}
+
+
+// centerChartContent centers chart content on the screen
+func (m model) centerChartContent(chartView string, chartWidth int) string {
+	lines := strings.Split(chartView, "\n")
+	var centeredLines []string
+	
+	for _, line := range lines {
+		// Calculate padding needed to center the line
+		paddingNeeded := (m.width - chartWidth) / 2
+		if paddingNeeded > 0 {
+			centeredLine := strings.Repeat(" ", paddingNeeded) + line
+			centeredLines = append(centeredLines, centeredLine)
+		} else {
+			centeredLines = append(centeredLines, line)
+		}
+	}
+	
+	return strings.Join(centeredLines, "\n")
+}
+
 
 func main() {
 	m := initialModel()
