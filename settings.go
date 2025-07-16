@@ -108,10 +108,10 @@ func (sm *SettingsManager) loadDefaultThemes() {
 		Foreground:    "252", // Light gray
 		Muted:         "240", // Medium gray
 		Border:        "241", // Border gray
-		Highlight:     "205", // Pink highlight
-		Success:       "46",  // Green
-		Warning:       "226", // Yellow
-		Error:         "196", // Red
+		Highlight:     "213", // Light magenta (more cohesive with pink theme)
+		Success:       "141", // Soft purple (replaces jarring green)
+		Warning:       "219", // Soft pink-orange (softer than yellow)
+		Error:         "204", // Soft red-pink (less harsh)
 		GradientStart: "147", // Light purple
 		GradientEnd:   "205", // Pink
 	}
@@ -199,6 +199,40 @@ func (sm *SettingsManager) loadDefaultThemes() {
 		Error:         "160", // Dark red
 		GradientStart: "208", // Orange
 		GradientEnd:   "196", // Red
+	}
+	
+	// Neon theme (vibrant colors)
+	sm.themes["neon"] = Theme{
+		Name:          "Neon",
+		Primary:       "205", // Bright pink
+		Secondary:     "46",  // Bright green
+		Background:    "232", // Very dark gray
+		Foreground:    "255", // White
+		Muted:         "240", // Gray
+		Border:        "205", // Pink border
+		Highlight:     "226", // Bright yellow
+		Success:       "46",  // Bright green
+		Warning:       "208", // Bright orange
+		Error:         "196", // Bright red
+		GradientStart: "46",  // Bright green
+		GradientEnd:   "205", // Bright pink
+	}
+	
+	// Monochrome theme (grayscale)
+	sm.themes["monochrome"] = Theme{
+		Name:          "Monochrome",
+		Primary:       "255", // White
+		Secondary:     "250", // Light gray
+		Background:    "235", // Dark gray
+		Foreground:    "252", // Light gray
+		Muted:         "240", // Medium gray
+		Border:        "244", // Light border
+		Highlight:     "255", // White highlight
+		Success:       "252", // Light gray
+		Warning:       "248", // Medium-light gray
+		Error:         "250", // Light gray
+		GradientStart: "240", // Medium gray
+		GradientEnd:   "255", // White
 	}
 }
 

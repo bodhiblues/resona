@@ -588,6 +588,26 @@ func (lb *LibraryBrowser) ResetViewport() {
 	lb.adjustCategoryViewport()
 }
 
+func (lb *LibraryBrowser) ForceViewportReset() {
+	// Force a complete viewport reset with bounds checking
+	lb.contentViewport.top = 0
+	lb.categoryViewport.top = 0
+	lb.contentIndex = 0
+	lb.categoryIndex = 0
+	
+	// Ensure indices are within bounds
+	if len(lb.contents) > 0 && lb.contentIndex >= len(lb.contents) {
+		lb.contentIndex = 0
+	}
+	if len(lb.categories) > 0 && lb.categoryIndex >= len(lb.categories) {
+		lb.categoryIndex = 0
+	}
+	
+	// Force viewport adjustment
+	lb.adjustContentViewport()
+	lb.adjustCategoryViewport()
+}
+
 func (lb *LibraryBrowser) ResetViewportOnly() {
 	lb.contentViewport.top = 0
 	lb.categoryViewport.top = 0

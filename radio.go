@@ -16,7 +16,8 @@ import (
 type RadioStation struct {
 	Name        string            `json:"name"`
 	URL         string            `json:"url"`
-	StreamURL   string            `json:"stream_url"`   // Actual stream URL (resolved from PLS/M3U)
+	StreamURL   string            `json:"stream_url"`   // Primary stream URL (for backward compatibility)
+	StreamURLs  []string          `json:"stream_urls"`  // All available stream URLs (with fallbacks)
 	Genre       string            `json:"genre"`
 	Language    string            `json:"language"`
 	Country     string            `json:"country"`
@@ -90,13 +91,15 @@ func (rl *RadioLibrary) AddStation(station RadioStation) error {
 	
 	// Resolve stream URL if it's a playlist
 	if strings.Contains(station.URL, ".pls") || strings.Contains(station.URL, ".m3u") {
-		streamURL, err := resolvePlaylistURL(station.URL)
+		streamURLs, err := resolvePlaylistURL(station.URL)
 		if err != nil {
 			return fmt.Errorf("failed to resolve playlist URL: %w", err)
 		}
-		station.StreamURL = streamURL
+		station.StreamURLs = streamURLs
+		station.StreamURL = streamURLs[0] // Set primary URL for backward compatibility
 	} else {
 		station.StreamURL = station.URL
+		station.StreamURLs = []string{station.URL} // Single URL as array
 	}
 	
 	rl.stations = append(rl.stations, station)
@@ -157,16 +160,16 @@ func (rl *RadioLibrary) GetGenres() []string {
 	return genres
 }
 
-// resolvePlaylistURL parses PLS/M3U files and returns the first stream URL
-func resolvePlaylistURL(playlistURL string) (string, error) {
+// resolvePlaylistURL parses PLS/M3U files and returns all stream URLs
+func resolvePlaylistURL(playlistURL string) ([]string, error) {
 	resp, err := http.Get(playlistURL)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch playlist: %w", err)
+		return nil, fmt.Errorf("failed to fetch playlist: %w", err)
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to fetch playlist: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("failed to fetch playlist: HTTP %d", resp.StatusCode)
 	}
 	
 	scanner := bufio.NewScanner(resp.Body)
@@ -178,29 +181,47 @@ func resolvePlaylistURL(playlistURL string) (string, error) {
 		return parseM3U(scanner)
 	}
 	
-	return "", fmt.Errorf("unsupported playlist format")
+	return nil, fmt.Errorf("unsupported playlist format")
 }
 
-// parsePLS parses PLS playlist format
-func parsePLS(scanner *bufio.Scanner) (string, error) {
+// parsePLS parses PLS playlist format and returns all stream URLs
+func parsePLS(scanner *bufio.Scanner) ([]string, error) {
+	urls := make([]string, 0)
+	
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "File1=") {
-			return strings.TrimPrefix(line, "File1="), nil
+		if strings.HasPrefix(line, "File") && strings.Contains(line, "=") {
+			// Extract URL after the = sign
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 && strings.HasPrefix(parts[1], "http") {
+				urls = append(urls, parts[1])
+			}
 		}
 	}
-	return "", fmt.Errorf("no stream URL found in PLS file")
+	
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no stream URLs found in PLS file")
+	}
+	
+	return urls, nil
 }
 
-// parseM3U parses M3U playlist format
-func parseM3U(scanner *bufio.Scanner) (string, error) {
+// parseM3U parses M3U playlist format and returns all stream URLs
+func parseM3U(scanner *bufio.Scanner) ([]string, error) {
+	urls := make([]string, 0)
+	
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			return line, nil
+		if line != "" && !strings.HasPrefix(line, "#") && strings.HasPrefix(line, "http") {
+			urls = append(urls, line)
 		}
 	}
-	return "", fmt.Errorf("no stream URL found in M3U file")
+	
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no stream URLs found in M3U file")
+	}
+	
+	return urls, nil
 }
 
 // UpdateLastPlayed updates the last played time for a station

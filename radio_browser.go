@@ -296,13 +296,15 @@ func (rb *RadioBrowser) PlayQuickStation() (*RadioStation, error) {
 	
 	// Resolve stream URL if it's a playlist
 	if strings.Contains(station.URL, ".pls") || strings.Contains(station.URL, ".m3u") {
-		streamURL, err := resolvePlaylistURL(station.URL)
+		streamURLs, err := resolvePlaylistURL(station.URL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve playlist URL: %w", err)
 		}
-		station.StreamURL = streamURL
+		station.StreamURLs = streamURLs
+		station.StreamURL = streamURLs[0] // Set primary URL for backward compatibility
 	} else {
 		station.StreamURL = station.URL
+		station.StreamURLs = []string{station.URL} // Single URL as array
 	}
 	
 	return station, nil

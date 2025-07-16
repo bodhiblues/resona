@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -370,6 +368,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = 0
 				m.libraryBrowser.ResetViewport()
 			}
+			
+			// Reset viewport whenever switching TO library view
+			if m.currentView == "library" {
+				m.libraryBrowser.ForceViewportReset()
+				// Also ensure the viewport height is properly set
+				headerHeight := 1
+				tabsHeight := 1
+				statusHeight := 1
+				nowPlayingHeight := 0
+				if m.playingSong != nil || m.playingStation != nil {
+					nowPlayingHeight = m.calculateNowPlayingHeight()
+				}
+				contentHeight := m.height - headerHeight - tabsHeight - statusHeight - nowPlayingHeight - 3
+				if contentHeight < 5 {
+					contentHeight = 5
+				}
+				m.libraryBrowser.SetViewportHeight(contentHeight)
+			}
 			return m, nil
 		case "a":
 			if m.currentView == "folder" {
@@ -380,7 +396,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.libraryBrowser.Refresh()
 							m.currentView = "library"
 							m.selected = 0
-							m.libraryBrowser.ResetViewport()
+							m.libraryBrowser.ForceViewportReset()
 						}
 					}
 				}
@@ -1288,6 +1304,10 @@ func (m model) activateControl() (model, tea.Cmd) {
 		m.audioPlayer.Stop()
 		m.playing = ""
 		m.playingSong = nil
+		m.playingStation = nil
+		m.radioStartTime = time.Time{}
+		m.radioPausedTime = 0
+		m.radioWasPaused = false
 		m.nowPlayingFocused = false
 		return m, nil
 	}
@@ -1471,7 +1491,11 @@ func (m model) getRightPaneLines(theme Theme) []string {
 	
 	// Calculate viewport based on selected content item
 	var viewportTop int
-	if selectedIndex < len(itemToLineMap) {
+	
+	// If viewport was just reset (top == 0), use simple calculation
+	if viewport.top == 0 {
+		viewportTop = 0
+	} else if selectedIndex < len(itemToLineMap) {
 		selectedLineIndex := itemToLineMap[selectedIndex]
 		// Adjust for breadcrumb offset
 		contentLineIndex := selectedLineIndex - contentStartIndex
@@ -1834,6 +1858,11 @@ func (m *model) playCurrentTrack() bool {
 		if err := m.audioPlayer.Play(song.FilePath); err == nil {
 			m.playing = song.Title
 			m.playingSong = &song
+			// Reset radio variables when switching to library playback
+			m.playingStation = nil
+			m.radioStartTime = time.Time{}
+			m.radioPausedTime = 0
+			m.radioWasPaused = false
 			m.audioPlayer.SetDuration(song.DurationSecs)
 			return true
 		}
@@ -2611,74 +2640,16 @@ func createVisualizer(theme Theme) barchart.Model {
 	return barchart.New(1, 1)
 }
 
-// generateMockAudioData generates mock frequency data for the visualizer
-func generateMockAudioData(isPlaying bool) []barchart.BarData {
-	data := make([]barchart.BarData, 12)
-	
-	if !isPlaying {
-		// Return silent data when not playing
-		for i := 0; i < len(data); i++ {
-			data[i] = barchart.BarData{
-				Label: fmt.Sprintf("F%d", i+1),
-				Values: []barchart.BarValue{
-					{"", 0.0, lipgloss.NewStyle().Foreground(lipgloss.Color("240"))},
-				},
-			}
-		}
-		return data
-	}
-	
-	// Generate mock frequency data with realistic patterns
-	for i := 0; i < len(data); i++ {
-		// Lower frequencies (bass) tend to have more energy
-		baseValue := 0.3
-		if i < 3 {
-			baseValue = 0.6 // More bass
-		} else if i < 6 {
-			baseValue = 0.4 // Mid frequencies
-		} else {
-			baseValue = 0.2 // Higher frequencies
-		}
-		
-		// Add some randomness to simulate real audio
-		randomFactor := 0.3 + rand.Float64()*0.7
-		
-		// Add some periodic variation to make it look more musical
-		timeVariation := 0.8 + 0.2*math.Sin(float64(time.Now().UnixNano()/1000000)*0.001*float64(i+1))
-		
-		value := baseValue * randomFactor * timeVariation
-		if value > 1.0 {
-			value = 1.0
-		}
-		
-		// Use different colors for different frequency ranges
-		var barColor string
-		if i < 3 {
-			barColor = "9"  // Red for bass
-		} else if i < 6 {
-			barColor = "11" // Yellow for mid
-		} else {
-			barColor = "10" // Green for highs
-		}
-		
-		data[i] = barchart.BarData{
-			Label: fmt.Sprintf("F%d", i+1),
-			Values: []barchart.BarValue{
-				{"", value, lipgloss.NewStyle().Foreground(lipgloss.Color(barColor))},
-			},
-		}
-	}
-	
-	return data
-}
 
 // renderVisualizer renders the music visualizer using real audio data
 func (m *model) renderVisualizer(width int) string {
 	isPlaying := m.audioPlayer.IsPlaying()
+	theme := m.settingsManager.GetTheme()
 	
 	if !isPlaying {
-		// Show flat line when not playing
-		return strings.Repeat("▁", width)
+		// Show flat line when not playing with muted color
+		mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+		return mutedStyle.Render(strings.Repeat("▁", width))
 	}
 	
 	// Get real audio samples from the audio player
@@ -2734,14 +2705,37 @@ func (m *model) renderVisualizer(width int) string {
 			barChar = "█"
 		}
 		
-		// Color the bar based on frequency range (simulated)
+		// Color the bar based on frequency range using harmonious theme colors
 		var style lipgloss.Style
+		intensity := amplitude
+		
 		if i < numBars/4 {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // Red for bass
+			// Bass frequencies - use primary colors and variations
+			if intensity > 0.7 {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+			} else if intensity > 0.4 {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary))
+			} else {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+			}
 		} else if i < numBars/2 {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // Yellow for mid
+			// Mid frequencies - use secondary and primary colors
+			if intensity > 0.7 {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary))
+			} else if intensity > 0.4 {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+			} else {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+			}
 		} else {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // Green for highs
+			// High frequencies - use gradient colors for harmony
+			if intensity > 0.7 {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientStart))
+			} else if intensity > 0.4 {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientEnd))
+			} else {
+				style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+			}
 		}
 		
 		bars = append(bars, style.Render(barChar))
@@ -2895,15 +2889,18 @@ func (m model) renderUnicodeVisualizer(audioSamples []float64, width, height int
 					amplitude = neighborSum / float64(neighbors+1)
 				}
 				
-				// Amplify the signal for better visualization
-				amplitude *= 4.5
-				if amplitude > 1.0 {
-					amplitude = 1.0
+				// Apply more nuanced amplitude scaling for better detail
+				// Use a gentler amplification to avoid hitting max values too easily
+				amplitude *= 2.5
+				
+				// Apply logarithmic scaling to preserve detail at different levels
+				if amplitude > 0.1 {
+					amplitude = 0.1 + (amplitude-0.1)*0.7 // Compress higher values
 				}
 				
-				// Add some sparkle effect for high frequencies
-				if i > width/2 && amplitude > 0.7 {
-					amplitude = math.Min(amplitude * 1.2, 1.0)
+				// Final clamp to ensure we don't exceed 1.0
+				if amplitude > 1.0 {
+					amplitude = 1.0
 				}
 			} else {
 				// Show minimal activity when not playing
@@ -2936,43 +2933,43 @@ func (m model) renderUnicodeVisualizer(audioSamples []float64, width, height int
 				barChar = blockChars[subLevel]
 			}
 			
-			// Color the bar based on frequency range using theme colors
+			// Color the bar based on frequency range using harmonious theme colors
 			var style lipgloss.Style
 			intensity := amplitude
 			
 			if i < width/4 {
-				// Bass frequencies - use primary/error colors
-				if intensity > 0.7 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Error))
-				} else if intensity > 0.4 {
+				// Bass frequencies - use primary colors and variations
+				if intensity > 0.5 {
 					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+				} else if intensity > 0.2 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary))
 				} else {
 					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
 				}
 			} else if i < width/2 {
-				// Mid frequencies - use warning/success colors
-				if intensity > 0.7 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Warning))
-				} else if intensity > 0.4 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Success))
+				// Mid frequencies - use secondary and primary colors
+				if intensity > 0.5 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary))
+				} else if intensity > 0.2 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
 				} else {
 					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
 				}
 			} else if i < 3*width/4 {
-				// High-mid frequencies - use secondary/primary colors
-				if intensity > 0.7 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary))
-				} else if intensity > 0.4 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+				// High-mid frequencies - use gradient colors for harmony
+				if intensity > 0.5 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientStart))
+				} else if intensity > 0.2 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientEnd))
 				} else {
 					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
 				}
 			} else {
-				// Treble frequencies - use highlight/primary colors
-				if intensity > 0.7 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Highlight))
-				} else if intensity > 0.4 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+				// Treble frequencies - use gradient colors with primary
+				if intensity > 0.5 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientEnd))
+				} else if intensity > 0.2 {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientStart))
 				} else {
 					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
 				}
@@ -3022,16 +3019,16 @@ func (m model) renderBarChart(audioSamples []float64, width, height int, isPlayi
 			amplitude = 100
 		}
 		
-		// Color based on frequency range using theme colors
+		// Color based on frequency range using harmonious theme colors
 		var style lipgloss.Style
 		if i < numBars/4 {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Error)) // Bass
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary)) // Bass
 		} else if i < numBars/2 {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Warning)) // Mid
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary)) // Mid
 		} else if i < 3*numBars/4 {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary)) // High-mid
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientStart)) // High-mid
 		} else {
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Highlight)) // Treble
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientEnd)) // Treble
 		}
 		
 		barData = append(barData, barchart.BarData{
@@ -3065,14 +3062,28 @@ func (m model) renderLineChart(audioSamples []float64, width, height int, isPlay
 	// Create a simple line chart representation
 	var content []string
 	
-	// Process samples to fit width
+	// Process samples to fit width with proper amplification
 	processedSamples := make([]float64, width)
 	for i := 0; i < width; i++ {
 		sampleIndex := (i * len(audioSamples)) / width
 		if sampleIndex >= len(audioSamples) {
 			sampleIndex = len(audioSamples) - 1
 		}
-		processedSamples[i] = audioSamples[sampleIndex] * float64(height)
+		
+		amplitude := audioSamples[sampleIndex]
+		
+		// Apply amplification for better visibility (more aggressive than other visualizers)
+		amplitude *= 4.0
+		
+		// Clamp to reasonable range
+		if amplitude > 1.0 {
+			amplitude = 1.0
+		}
+		if amplitude < 0.0 {
+			amplitude = 0.0
+		}
+		
+		processedSamples[i] = amplitude * float64(height)
 	}
 	
 	// Create line visualization
@@ -3081,16 +3092,16 @@ func (m model) renderLineChart(audioSamples []float64, width, height int, isPlay
 		for i := 0; i < width; i++ {
 			barHeight := int(processedSamples[i])
 			if barHeight >= (height - row) {
-				// Color based on position using theme colors
+				// Color based on position using harmonious theme colors
 				var style lipgloss.Style
 				if i < width/4 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Error)) // Bass
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary)) // Bass
 				} else if i < width/2 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Warning)) // Mid
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary)) // Mid
 				} else if i < 3*width/4 {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Secondary)) // High-mid
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientStart)) // High-mid
 				} else {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Highlight)) // Treble
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.GradientEnd)) // Treble
 				}
 				line = append(line, style.Render("●"))
 			} else {
