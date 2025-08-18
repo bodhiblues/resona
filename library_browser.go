@@ -543,6 +543,9 @@ func (lb *LibraryBrowser) GoBack() {
 	}
 	
 	lb.contentIndex = 0
+	// Reset viewport to ensure proper scrolling
+	lb.contentViewport.top = 0
+	lb.adjustContentViewport()
 }
 
 func (lb *LibraryBrowser) GetCategories() []string {
