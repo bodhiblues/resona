@@ -294,15 +294,22 @@ func (lb *LibraryBrowser) adjustCategoryViewport() {
 }
 
 func (lb *LibraryBrowser) adjustContentViewport() {
-	// Only adjust if the selected content is actually outside the viewport
-	// This prevents unnecessary viewport shifts when height changes slightly
-	if lb.contentIndex < lb.contentViewport.top {
-		lb.contentViewport.top = lb.contentIndex
-	} else if lb.contentIndex >= lb.contentViewport.top+lb.contentViewport.height {
-		// Only adjust if we really need to (selected item is not visible)
-		if lb.contentViewport.height > 0 {
-			lb.contentViewport.top = lb.contentIndex - lb.contentViewport.height + 1
-		}
+	// Calculate line positions for each item (each item = 2 lines)
+	// Add lines for breadcrumb if present
+	breadcrumbLines := 0
+	if len(lb.breadcrumb) > 0 {
+		breadcrumbLines = 2 // breadcrumb text + empty line
+	}
+	
+	// Calculate the line index of the selected item
+	selectedLineIndex := breadcrumbLines + (lb.contentIndex * 2)
+	
+	// Adjust viewport to keep selected item visible
+	if selectedLineIndex < lb.contentViewport.top {
+		lb.contentViewport.top = selectedLineIndex
+	} else if selectedLineIndex+1 >= lb.contentViewport.top+lb.contentViewport.height {
+		// +1 to account for subtitle line
+		lb.contentViewport.top = selectedLineIndex - lb.contentViewport.height + 2
 	}
 	
 	// Ensure we don't go below 0
@@ -310,12 +317,12 @@ func (lb *LibraryBrowser) adjustContentViewport() {
 		lb.contentViewport.top = 0
 	}
 	
+	// Calculate total lines
+	totalLines := breadcrumbLines + (len(lb.contents) * 2)
+	
 	// Ensure we don't exceed content bounds
-	if len(lb.contents) > 0 && lb.contentViewport.top >= len(lb.contents) {
-		lb.contentViewport.top = len(lb.contents) - 1
-		if lb.contentViewport.top < 0 {
-			lb.contentViewport.top = 0
-		}
+	if totalLines > lb.contentViewport.height && lb.contentViewport.top > totalLines - lb.contentViewport.height {
+		lb.contentViewport.top = totalLines - lb.contentViewport.height
 	}
 }
 
@@ -542,10 +549,10 @@ func (lb *LibraryBrowser) GoBack() {
 		lb.refreshContents()
 	}
 	
+	// Reset to the top of the list
 	lb.contentIndex = 0
-	// Reset viewport to ensure proper scrolling
 	lb.contentViewport.top = 0
-	lb.adjustContentViewport()
+	// Don't call adjustContentViewport() here as we want to force top position
 }
 
 func (lb *LibraryBrowser) GetCategories() []string {

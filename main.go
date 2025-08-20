@@ -581,17 +581,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	// Calculate available heights
+	// Calculate fixed component heights
 	headerHeight := 1
 	tabsHeight := 1
 	statusHeight := 1
 	nowPlayingHeight := 0
-	if m.playingSong != nil {
-		nowPlayingHeight = 10 // Updated height for now playing box with spacing
+	if m.playingSong != nil || m.playingStation != nil {
+		nowPlayingHeight = 10 // Height for now playing box
 	}
 	
 	// Calculate content viewport height
-	availableHeight := m.height - headerHeight - tabsHeight - statusHeight - nowPlayingHeight - 3 // 3 for spacing
+	// Account for all fixed elements plus spacing
+	spacing := 3 // Spacing between sections
+	if nowPlayingHeight > 0 {
+		spacing = 4 // Extra spacing when now playing is shown
+	}
+	availableHeight := m.height - headerHeight - tabsHeight - statusHeight - nowPlayingHeight - spacing
 	if availableHeight < 5 {
 		availableHeight = 5
 	}
@@ -604,7 +609,7 @@ func (m model) View() string {
 		PaddingLeft(2)
 
 	statusStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color(theme.Muted)).
+		Foreground(lipgloss.Color("#FFFFFF")).
 		PaddingLeft(2)
 
 	headerText := "🎵 Resona - Terminal Music Player"
@@ -668,23 +673,49 @@ func (m model) View() string {
 		playStatus,
 		controlsText))
 
-	// Build the main view
-	var viewParts []string
-	viewParts = append(viewParts, header)
-	viewParts = append(viewParts, tabs)
-	viewParts = append(viewParts, "")
-	viewParts = append(viewParts, content)
+	// Build the layout with fixed positioning
+	// Top section (header + tabs + content)
+	topSection := lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		tabs,
+		"",
+		content,
+	)
 	
-	// Add now playing view if a song or radio station is playing
+	// Bottom section (now playing + status)
+	var bottomSection string
 	if m.playingSong != nil || m.playingStation != nil {
-		viewParts = append(viewParts, "")
-		viewParts = append(viewParts, m.renderNowPlaying())
+		bottomSection = lipgloss.JoinVertical(lipgloss.Left,
+			m.renderNowPlaying(),
+			"",
+			status,
+		)
+	} else {
+		bottomSection = status
 	}
 	
-	viewParts = append(viewParts, "")
-	viewParts = append(viewParts, status)
-
-	mainView := lipgloss.JoinVertical(lipgloss.Left, viewParts...)
+	// Calculate the height for the top section
+	bottomSectionHeight := statusHeight
+	if m.playingSong != nil || m.playingStation != nil {
+		bottomSectionHeight = nowPlayingHeight + statusHeight + 1 // +1 for spacing
+	}
+	
+	// Use Place to position the bottom section at the bottom
+	fullHeight := m.height
+	topSectionHeight := fullHeight - bottomSectionHeight - 1
+	
+	// Ensure the top section fills its allocated space
+	topSectionStyled := lipgloss.NewStyle().
+		Height(topSectionHeight).
+		MaxHeight(topSectionHeight).
+		Render(topSection)
+	
+	// Combine top and bottom sections
+	mainView := lipgloss.JoinVertical(lipgloss.Left,
+		topSectionStyled,
+		"",
+		bottomSection,
+	)
 	
 	// Overlay search if active
 	if m.searchMode {
@@ -929,13 +960,8 @@ func (m model) calculateNowPlayingHeight() int {
 		return 0
 	}
 	
-	// Calculate the actual height of the now-playing section
-	// Structure: title + empty + info + empty + progress + empty + controls
-	// Plus border and padding
-	contentLines := 7 // title, empty, info, empty, progress, empty, controls
-	borderAndPadding := 4 // top/bottom border + padding
-	
-	return contentLines + borderAndPadding
+	// Fixed height for now playing section
+	return 10
 }
 
 func (m model) renderNowPlaying() string {
@@ -1418,7 +1444,6 @@ func (m model) getRightPaneLines(theme Theme) []string {
 	
 	// Build all lines first
 	var allLines []string
-	var contentStartIndex int = 0
 	
 	// Add breadcrumb if present
 	breadcrumb := m.libraryBrowser.GetBreadcrumb()
@@ -1427,7 +1452,6 @@ func (m model) getRightPaneLines(theme Theme) []string {
 		breadcrumbStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Foreground))
 		allLines = append(allLines, breadcrumbStyle.Render("📁 "+strings.Join(breadcrumb, " > ")))
 		allLines = append(allLines, "")
-		contentStartIndex = 2
 	}
 	
 	// Track which line corresponds to each content item for viewport calculation
@@ -1489,35 +1513,16 @@ func (m model) getRightPaneLines(theme Theme) []string {
 		return allLines
 	}
 	
-	// Calculate viewport based on selected content item
-	var viewportTop int
+	// Use the viewport.top directly from library browser
+	// The library browser manages its own viewport positioning
+	viewportTop := viewport.top
 	
-	// If viewport was just reset (top == 0), use simple calculation
-	if viewport.top == 0 {
+	// Ensure we don't go past the end
+	if viewportTop > len(allLines) - viewport.height {
+		viewportTop = len(allLines) - viewport.height
+	}
+	if viewportTop < 0 {
 		viewportTop = 0
-	} else if selectedIndex < len(itemToLineMap) {
-		selectedLineIndex := itemToLineMap[selectedIndex]
-		// Adjust for breadcrumb offset
-		contentLineIndex := selectedLineIndex - contentStartIndex
-		
-		// Calculate viewport top to keep selected item visible
-		if contentLineIndex < viewport.top {
-			viewportTop = contentLineIndex + contentStartIndex
-		} else if contentLineIndex >= viewport.top + viewport.height - contentStartIndex {
-			viewportTop = contentLineIndex - viewport.height + contentStartIndex + 1
-		} else {
-			viewportTop = viewport.top + contentStartIndex
-		}
-		
-		// Ensure we don't go negative or past the end
-		if viewportTop < 0 {
-			viewportTop = 0
-		}
-		if viewportTop + viewport.height > len(allLines) {
-			viewportTop = len(allLines) - viewport.height
-		}
-	} else {
-		viewportTop = viewport.top
 	}
 	
 	// Return only the visible portion
