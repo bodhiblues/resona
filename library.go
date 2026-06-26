@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -189,7 +190,185 @@ func calculateDuration(filePath string) float64 {
 	}
 }
 
+// calculateMP3Duration returns the duration of an MP3 file. It first tries the
+// fast path of reading the frame and VBR (Xing/Info/VBRI) headers; only if that
+// fails does it fall back to decoding every frame (accurate but slow).
 func calculateMP3Duration(filePath string) float64 {
+	if d := mp3DurationFromHeader(filePath); d > 0 {
+		return d
+	}
+	return mp3DurationByDecoding(filePath)
+}
+
+// MP3 lookup tables, indexed by the 4-bit fields of the frame header. Only
+// Layer III (the "MP3" layer) is covered; other layers fall back to decoding.
+var (
+	mp3BitratesV1L3 = [16]int{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0} // MPEG 1, kbps
+	mp3BitratesV2L3 = [16]int{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}     // MPEG 2/2.5, kbps
+	mp3SampleRates  = map[int][3]int{
+		1:  {44100, 48000, 32000}, // MPEG 1
+		2:  {22050, 24000, 16000}, // MPEG 2
+		25: {11025, 12000, 8000},  // MPEG 2.5
+	}
+)
+
+type mp3FrameInfo struct {
+	version         int // 1, 2, or 25
+	bitrate         int // bits per second
+	sampleRate      int // Hz
+	samplesPerFrame int
+	sideInfoSize    int // bytes, used to locate the Xing/Info tag
+}
+
+// parseMP3FrameHeader parses a 4-byte MPEG Layer III frame header, returning
+// false for non-Layer-III, reserved, or free-format frames.
+func parseMP3FrameHeader(b []byte) (mp3FrameInfo, bool) {
+	if len(b) < 4 || b[0] != 0xFF || b[1]&0xE0 != 0xE0 {
+		return mp3FrameInfo{}, false
+	}
+	verBits := (b[1] >> 3) & 0x3
+	layerBits := (b[1] >> 1) & 0x3
+	brIndex := int((b[2] >> 4) & 0xF)
+	srIndex := int((b[2] >> 2) & 0x3)
+	chMode := (b[3] >> 6) & 0x3
+
+	if layerBits != 0x1 { // 0b01 == Layer III
+		return mp3FrameInfo{}, false
+	}
+	if brIndex == 0 || brIndex == 15 || srIndex == 3 {
+		return mp3FrameInfo{}, false // free-format or invalid
+	}
+
+	var fi mp3FrameInfo
+	switch verBits {
+	case 3: // MPEG 1
+		fi.version, fi.samplesPerFrame = 1, 1152
+		fi.bitrate = mp3BitratesV1L3[brIndex] * 1000
+	case 2: // MPEG 2
+		fi.version, fi.samplesPerFrame = 2, 576
+		fi.bitrate = mp3BitratesV2L3[brIndex] * 1000
+	case 0: // MPEG 2.5
+		fi.version, fi.samplesPerFrame = 25, 576
+		fi.bitrate = mp3BitratesV2L3[brIndex] * 1000
+	default: // reserved
+		return mp3FrameInfo{}, false
+	}
+	fi.sampleRate = mp3SampleRates[fi.version][srIndex]
+	if fi.sampleRate == 0 || fi.bitrate == 0 {
+		return mp3FrameInfo{}, false
+	}
+
+	mono := chMode == 0x3
+	switch {
+	case fi.version == 1 && mono:
+		fi.sideInfoSize = 17
+	case fi.version == 1:
+		fi.sideInfoSize = 32
+	case mono:
+		fi.sideInfoSize = 9
+	default:
+		fi.sideInfoSize = 17
+	}
+	return fi, true
+}
+
+// mp3VBRFrameCount returns the total frame count from a Xing/Info or VBRI tag in
+// the first frame, or 0 if neither is present (i.e. the file is likely CBR).
+func mp3VBRFrameCount(frame []byte, fi mp3FrameInfo) int {
+	// Xing / Info: located after the 4-byte header plus the side-info block.
+	if off := 4 + fi.sideInfoSize; off+12 <= len(frame) {
+		if tag := string(frame[off : off+4]); tag == "Xing" || tag == "Info" {
+			flags := binary.BigEndian.Uint32(frame[off+4 : off+8])
+			if flags&0x1 != 0 { // bit 0: frame count present
+				return int(binary.BigEndian.Uint32(frame[off+8 : off+12]))
+			}
+		}
+	}
+	// VBRI: always 32 bytes after the header; frame count is at offset +14.
+	if off := 4 + 32; off+18 <= len(frame) && string(frame[off:off+4]) == "VBRI" {
+		return int(binary.BigEndian.Uint32(frame[off+14 : off+18]))
+	}
+	return 0
+}
+
+// mp3DurationFromHeader computes duration by reading only the first frame's
+// headers: an exact value for VBR files with a Xing/VBRI tag, or a constant-
+// bitrate estimate otherwise. Returns 0 if the headers can't be parsed.
+func mp3DurationFromHeader(filePath string) float64 {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+	fileSize := stat.Size()
+
+	// Skip an ID3v2 tag, if present, to locate the first audio frame.
+	var dataStart int64
+	hdr := make([]byte, 10)
+	if _, err := io.ReadFull(f, hdr); err == nil && string(hdr[0:3]) == "ID3" {
+		size := int64(hdr[6]&0x7F)<<21 | int64(hdr[7]&0x7F)<<14 | int64(hdr[8]&0x7F)<<7 | int64(hdr[9]&0x7F)
+		dataStart = 10 + size
+		if hdr[5]&0x10 != 0 {
+			dataStart += 10 // ID3v2 footer present
+		}
+	}
+
+	// Read a window large enough to hold the first frame and its VBR header.
+	if _, err := f.Seek(dataStart, io.SeekStart); err != nil {
+		return 0
+	}
+	buf := make([]byte, 4096)
+	n, _ := io.ReadFull(f, buf)
+	buf = buf[:n]
+
+	// Find the first valid Layer III frame header in the window.
+	for i := 0; i+4 <= len(buf); i++ {
+		if buf[i] != 0xFF {
+			continue
+		}
+		frameInfo, ok := parseMP3FrameHeader(buf[i:])
+		if !ok {
+			continue
+		}
+		frameStart := dataStart + int64(i)
+
+		// VBR: exact duration from the stored frame count.
+		if frames := mp3VBRFrameCount(buf[i:], frameInfo); frames > 0 {
+			totalSamples := int64(frames) * int64(frameInfo.samplesPerFrame)
+			return float64(totalSamples) / float64(frameInfo.sampleRate)
+		}
+
+		// CBR: estimate from the audio byte length and the constant bitrate.
+		audioBytes := fileSize - frameStart
+		if mp3HasID3v1(f, fileSize) {
+			audioBytes -= 128
+		}
+		if audioBytes <= 0 {
+			return 0
+		}
+		return float64(audioBytes) * 8.0 / float64(frameInfo.bitrate)
+	}
+	return 0
+}
+
+func mp3HasID3v1(f *os.File, fileSize int64) bool {
+	if fileSize < 128 {
+		return false
+	}
+	tag := make([]byte, 3)
+	if _, err := f.ReadAt(tag, fileSize-128); err != nil {
+		return false
+	}
+	return string(tag) == "TAG"
+}
+
+// mp3DurationByDecoding is the slow, robust fallback: it decodes every frame.
+func mp3DurationByDecoding(filePath string) float64 {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return 0
@@ -199,7 +378,7 @@ func calculateMP3Duration(filePath string) float64 {
 	decoder := mp3.NewDecoder(file)
 	var totalFrames int
 	var sampleRate int
-	
+
 	for {
 		frame := mp3.Frame{}
 		err := decoder.Decode(&frame, &sampleRate)
@@ -211,46 +390,50 @@ func calculateMP3Duration(filePath string) float64 {
 		}
 		totalFrames++
 	}
-	
+
 	if sampleRate == 0 || totalFrames == 0 {
 		return 0
 	}
-	
+
 	// Each MP3 frame contains 1152 samples for MPEG-1 Layer III
 	samplesPerFrame := 1152
 	totalSamples := totalFrames * samplesPerFrame
-	duration := float64(totalSamples) / float64(sampleRate)
-	
-	return duration
+	return float64(totalSamples) / float64(sampleRate)
 }
 
 func calculateFLACDuration(filePath string) float64 {
-	// Parse FLAC file to get StreamInfo block which contains exact duration
+	// Parse FLAC file to get the StreamInfo block, which usually contains the
+	// exact sample count.
 	stream, err := flac.ParseFile(filePath)
 	if err != nil {
 		return 0
 	}
+	defer stream.Close()
 
-	// Get the StreamInfo metadata block
 	info := stream.Info
-	if info == nil {
+	if info == nil || info.SampleRate == 0 {
 		return 0
 	}
 
-	// Check if we have valid sample rate
-	if info.SampleRate == 0 {
-		return 0
-	}
-
-	// Get total samples from StreamInfo block
 	totalSamples := info.NSamples
+	if totalSamples == 0 {
+		// STREAMINFO is allowed to record a total sample count of 0 ("unknown"),
+		// which some encoders/rippers do. The stream is positioned at the first
+		// audio frame, so walk the frames and sum their block sizes rather than
+		// reporting 0:00.
+		for {
+			frame, err := stream.ParseNext()
+			if err != nil {
+				break // io.EOF or a read error ends the stream
+			}
+			totalSamples += uint64(frame.BlockSize)
+		}
+	}
 	if totalSamples == 0 {
 		return 0
 	}
 
-	// Calculate exact duration: total_samples / sample_rate
-	duration := float64(totalSamples) / float64(info.SampleRate)
-	return duration
+	return float64(totalSamples) / float64(info.SampleRate)
 }
 
 func calculateWAVDuration(filePath string) float64 {
