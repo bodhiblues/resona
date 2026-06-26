@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NimbleMarkets/ntcharts/barchart"
-	"github.com/NimbleMarkets/ntcharts/linechart/wavelinechart"
-	"github.com/NimbleMarkets/ntcharts/canvas"
-	"github.com/NimbleMarkets/ntcharts/canvas/runes"
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/NimbleMarkets/ntcharts/v2/barchart"
+	"github.com/NimbleMarkets/ntcharts/v2/linechart/wavelinechart"
+	"github.com/NimbleMarkets/ntcharts/v2/canvas"
+	"github.com/NimbleMarkets/ntcharts/v2/canvas/runes"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type tickMsg time.Time
@@ -193,7 +193,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		keyStr := msg.String()
 		
 		// Handle radio input mode first (prevent function keys from working during text input)
@@ -580,7 +580,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
+	v := tea.NewView(m.renderView())
+	v.AltScreen = true
+	return v
+}
+
+func (m model) renderView() string {
 	// Calculate fixed component heights
 	headerHeight := 1
 	tabsHeight := 1
@@ -3039,7 +3045,7 @@ func (m model) renderBarChart(audioSamples []float64, width, height int, isPlayi
 		barData = append(barData, barchart.BarData{
 			Label: fmt.Sprintf("%d", i),
 			Values: []barchart.BarValue{
-				{fmt.Sprintf("%.0f", amplitude), amplitude, style},
+				{Name: fmt.Sprintf("%.0f", amplitude), Value: amplitude, Style: style},
 			},
 		})
 	}
@@ -3187,7 +3193,7 @@ func (m model) renderWaveChart(audioSamples []float64, width, height int, isPlay
 		
 		// Plot multiple points to create smoother wave curves
 		xPos := float64(i * width) / float64(numPoints)
-		wlc.Plot(canvas.Float64Point{xPos, amplitude})
+		wlc.Plot(canvas.Float64Point{X: xPos, Y: amplitude})
 		
 		// Add interpolated points between samples for smoother curves
 		if i < numPoints-1 {
@@ -3203,7 +3209,7 @@ func (m model) renderWaveChart(audioSamples []float64, width, height int, isPlay
 					interpFactor := float64(j) / 4.0
 					interpAmplitude := amplitude + (nextAmplitude - amplitude) * interpFactor
 					interpX := xPos + (float64(width) / float64(numPoints)) * interpFactor
-					wlc.Plot(canvas.Float64Point{interpX, interpAmplitude})
+					wlc.Plot(canvas.Float64Point{X: interpX, Y: interpAmplitude})
 				}
 			}
 		}
@@ -3241,7 +3247,7 @@ func main() {
 	m := initialModel()
 	defer m.audioPlayer.Close()
 	
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
 		os.Exit(1)
