@@ -134,6 +134,9 @@ type AudioPlayer struct {
 	startTime   time.Time
 	pausedTime  time.Duration
 	duration    float64 // Total duration in seconds
+	// Seeking (local files only; HTTP/radio streams aren't seekable)
+	streamer beep.StreamSeekCloser
+	seekable bool
 	// Audio visualization
 	audioSamples []float64
 	sampleMutex  sync.RWMutex
@@ -388,6 +391,9 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	ap.currentSong = filePath
 	ap.startTime = time.Now()
 	ap.pausedTime = 0
+	// Local files are seekable; live streams are not.
+	ap.streamer = streamer
+	ap.seekable = !isURL
 	ap.mutex.Unlock()
 
 	// Add to mixer with callback for cleanup
@@ -397,6 +403,8 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 		ap.mutex.Lock()
 		ap.isPlaying = false
 		ap.isPaused = false
+		ap.streamer = nil
+		ap.seekable = false
 		ap.mutex.Unlock()
 		streamer.Close()
 		reader.Close()
@@ -475,6 +483,8 @@ func (ap *AudioPlayer) Stop() {
 	ap.mixer.Clear()
 	speaker.Unlock()
 	
+	ap.streamer = nil
+	ap.seekable = false
 	ap.isPlaying = false
 	ap.isPaused = false
 	ap.currentSong = ""
@@ -564,8 +574,55 @@ func (ap *AudioPlayer) GetProgress() float64 {
 	if progress < 0 {
 		progress = 0
 	}
-	
+
 	return progress
+}
+
+// CanSeek reports whether the current source supports seeking (local files
+// only; live HTTP/radio streams are not seekable).
+func (ap *AudioPlayer) CanSeek() bool {
+	ap.mutex.RLock()
+	defer ap.mutex.RUnlock()
+	return ap.seekable && ap.streamer != nil
+}
+
+// Seek jumps to the given fraction (0..1) of the track. Returns an error if the
+// current source isn't seekable.
+func (ap *AudioPlayer) Seek(fraction float64) error {
+	ap.mutex.Lock()
+	defer ap.mutex.Unlock()
+
+	if !ap.seekable || ap.streamer == nil {
+		return fmt.Errorf("seeking is not supported for this source")
+	}
+	if fraction < 0 {
+		fraction = 0
+	}
+	if fraction > 1 {
+		fraction = 1
+	}
+
+	total := ap.streamer.Len()
+	target := int(fraction * float64(total))
+	if target >= total {
+		target = total - 1
+	}
+	if target < 0 {
+		target = 0
+	}
+
+	// speaker.Lock keeps us from seeking mid-Stream call.
+	speaker.Lock()
+	err := ap.streamer.Seek(target)
+	speaker.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// Re-anchor the time-based position tracking to the new position.
+	ap.pausedTime = time.Duration(fraction * ap.duration * float64(time.Second))
+	ap.startTime = time.Now()
+	return nil
 }
 
 func (ap *AudioPlayer) Close() {

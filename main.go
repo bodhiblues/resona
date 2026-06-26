@@ -277,6 +277,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseClickMsg:
 		return m.handleMouseClick(msg)
 
+	case tea.MouseMotionMsg:
+		// Left-drag across the progress bar scrubs/seeks.
+		if msg.Button == tea.MouseLeft {
+			m.seekFromMouse(msg)
+		}
+		return m, nil
+
 	case tea.KeyPressMsg:
 		keyStr := msg.String()
 		
@@ -1383,7 +1390,8 @@ func (m model) renderProgressBar(width int) string {
 	// Always show visualizer since we reserved space for it
 	visualizer := m.renderVisualizer(visualizerWidth)
 	
-	return bar + " " + timeStyle.Render(timeStr) + " " + visualizer
+	// Mark the bar itself as a clickable/draggable zone for seeking.
+	return zone.Mark("progress", bar) + " " + timeStyle.Render(timeStr) + " " + visualizer
 }
 
 func formatDurationFromSeconds(seconds float64) string {
@@ -1473,6 +1481,25 @@ func (m model) enterFolderSelection() {
 	}
 }
 
+// seekFromMouse maps a mouse position within the progress-bar zone to a 0..1
+// fraction and seeks there. Returns true if the event landed on the bar.
+func (m model) seekFromMouse(msg tea.MouseMsg) bool {
+	if m.playingSong == nil || !m.audioPlayer.CanSeek() {
+		return false
+	}
+	z := zone.Get("progress")
+	if z == nil || !z.InBounds(msg) {
+		return false
+	}
+	w := z.EndX - z.StartX
+	if w <= 0 {
+		return false
+	}
+	relX := msg.Mouse().X - z.StartX
+	m.audioPlayer.Seek(float64(relX) / float64(w))
+	return true
+}
+
 // handleMouseClick routes a left-click to whatever marked zone it lands on:
 // tabs, now-playing controls, or a library/folder row. A click on an
 // already-selected row activates it (play/open), like pressing Enter.
@@ -1505,6 +1532,11 @@ func (m model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 				return m.activateControl()
 			}
 		}
+	}
+
+	// Progress-bar seek (local files only).
+	if m.seekFromMouse(msg) {
+		return m, nil
 	}
 
 	// Content rows.
