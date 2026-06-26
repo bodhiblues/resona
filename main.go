@@ -15,6 +15,7 @@ import (
 	"github.com/NimbleMarkets/ntcharts/v2/canvas"
 	"github.com/NimbleMarkets/ntcharts/v2/canvas/runes"
 	"github.com/charmbracelet/x/ansi"
+	zone "github.com/lrstanley/bubblezone/v2"
 	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -272,6 +273,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.libraryBrowser.SetViewportHeight(contentHeight)
 		
 		return m, nil
+
+	case tea.MouseClickMsg:
+		return m.handleMouseClick(msg)
 
 	case tea.KeyPressMsg:
 		keyStr := msg.String()
@@ -597,24 +601,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.nowPlayingFocused {
 				return m.activateControl()
 			} else if m.currentView == "library" {
-				if song := m.libraryBrowser.EnterSelected(); song != nil {
-					// Create playlist based on current context
-					playlist := m.createPlaylistFromContext(song)
-					songIndex := m.findSongInPlaylist(playlist, song)
-					
-					if songIndex >= 0 {
-						m.setPlaylist(playlist, songIndex)
-						if m.playCurrentTrack() {
-							return m, tickCmd()
-						}
-					}
-				}
+				return m.enterLibrarySelection()
 			} else if m.currentView == "folder" {
-				if selected := m.folderBrowser.GetSelected(); selected != "" {
-					if m.folderBrowser.IsDirectory(selected) {
-						m.folderBrowser.EnterDirectory(selected)
-					}
-				}
+				m.enterFolderSelection()
 			} else if m.currentView == "radio" {
 				return m.handleRadioEnter()
 			} else if m.currentView == "visualizer" {
@@ -668,8 +657,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() tea.View {
-	v := tea.NewView(m.renderView())
+	// zone.Scan records the screen positions of all marked clickable regions.
+	v := tea.NewView(zone.Scan(m.renderView()))
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
 
@@ -941,9 +932,14 @@ func (m model) renderTabs() string {
 		settingsTab = activeTabStyle.Render(settingsTab)
 	}
 	
-	// Join tabs with spacing
-	tabsLine := lipgloss.JoinHorizontal(lipgloss.Top, libraryTab, " ", filesTab, " ", radioTab, " ", visualizerTab, " ", settingsTab)
-	
+	// Join tabs with spacing, marking each as a clickable zone.
+	tabsLine := lipgloss.JoinHorizontal(lipgloss.Top,
+		zone.Mark("tab_library", libraryTab), " ",
+		zone.Mark("tab_folder", filesTab), " ",
+		zone.Mark("tab_radio", radioTab), " ",
+		zone.Mark("tab_visualizer", visualizerTab), " ",
+		zone.Mark("tab_settings", settingsTab))
+
 	return tabsLine
 }
 
@@ -1196,9 +1192,9 @@ func (m model) renderNowPlaying() string {
 				Padding(0, 1)
 		}
 		
-		// Create button content
+		// Create button content (marked as a clickable zone)
 		buttonContent := fmt.Sprintf("%s %s", control, controlLabels[i])
-		controlParts = append(controlParts, buttonStyle.Render(buttonContent))
+		controlParts = append(controlParts, zone.Mark(fmt.Sprintf("ctrl_%d", i), buttonStyle.Render(buttonContent)))
 	}
 	
 	controlsLine := strings.Join(controlParts, "  ")
@@ -1451,6 +1447,102 @@ func (m model) renderLibrary() string {
 	return strings.Join(resultLines, "\n")
 }
 
+// enterLibrarySelection plays the currently selected library item (or drills
+// into it). Shared by the Enter key and mouse clicks.
+func (m model) enterLibrarySelection() (model, tea.Cmd) {
+	if song := m.libraryBrowser.EnterSelected(); song != nil {
+		playlist := m.createPlaylistFromContext(song)
+		songIndex := m.findSongInPlaylist(playlist, song)
+		if songIndex >= 0 {
+			m.setPlaylist(playlist, songIndex)
+			if m.playCurrentTrack() {
+				return m, tickCmd()
+			}
+		}
+	}
+	return m, nil
+}
+
+// enterFolderSelection opens the currently selected folder entry if it's a
+// directory. Shared by the Enter key and mouse clicks.
+func (m model) enterFolderSelection() {
+	if selected := m.folderBrowser.GetSelected(); selected != "" {
+		if m.folderBrowser.IsDirectory(selected) {
+			m.folderBrowser.EnterDirectory(selected)
+		}
+	}
+}
+
+// handleMouseClick routes a left-click to whatever marked zone it lands on:
+// tabs, now-playing controls, or a library/folder row. A click on an
+// already-selected row activates it (play/open), like pressing Enter.
+func (m model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if msg.Button != tea.MouseLeft {
+		return m, nil
+	}
+
+	// Tabs switch views.
+	for _, t := range []struct{ id, view string }{
+		{"tab_library", "library"},
+		{"tab_folder", "folder"},
+		{"tab_radio", "radio"},
+		{"tab_visualizer", "visualizer"},
+		{"tab_settings", "settings"},
+	} {
+		if zone.Get(t.id).InBounds(msg) {
+			m.currentView = t.view
+			return m, nil
+		}
+	}
+
+	// Now-playing transport controls.
+	if m.playingSong != nil || m.playingStation != nil {
+		for i := 0; i < 4; i++ {
+			if zone.Get(fmt.Sprintf("ctrl_%d", i)).InBounds(msg) {
+				// Activate the clicked control without stealing keyboard focus
+				// from the browser.
+				m.controlSelected = i
+				return m.activateControl()
+			}
+		}
+	}
+
+	// Content rows.
+	switch m.currentView {
+	case "library":
+		for i := range m.libraryBrowser.GetCategories() {
+			if zone.Get(fmt.Sprintf("libcat_%d", i)).InBounds(msg) {
+				m.libraryBrowser.SetCategoryIndex(i)
+				return m, nil
+			}
+		}
+		for i := range m.libraryBrowser.GetContents() {
+			if zone.Get(fmt.Sprintf("libitem_%d", i)).InBounds(msg) {
+				already := m.libraryBrowser.GetCurrentPane() == "contents" &&
+					m.libraryBrowser.GetContentIndex() == i
+				m.libraryBrowser.SetContentIndex(i)
+				if already {
+					return m.enterLibrarySelection()
+				}
+				return m, nil
+			}
+		}
+	case "folder":
+		for i := range m.folderBrowser.GetEntries() {
+			if zone.Get(fmt.Sprintf("folderitem_%d", i)).InBounds(msg) {
+				already := m.folderBrowser.GetSelectedIndex() == i
+				m.folderBrowser.SetSelectedIndex(i)
+				if already {
+					m.enterFolderSelection()
+				}
+				return m, nil
+			}
+		}
+	}
+
+	return m, nil
+}
+
 func (m model) activateControl() (model, tea.Cmd) {
 	switch m.controlSelected {
 	case 0: // Previous
@@ -1558,10 +1650,10 @@ func (m model) getLeftPaneLines(theme Theme) []string {
 			prefix = "  "
 		}
 		
-		line := style.Render(prefix + category)
+		line := zone.Mark(fmt.Sprintf("libcat_%d", i), style.Render(prefix+category))
 		allLines = append(allLines, line)
 	}
-	
+
 	// Apply viewport - for categories, we don't need complex viewport since there are only 3 categories
 	// Just return all lines since the category list is short
 	return allLines
@@ -1621,9 +1713,15 @@ func (m model) getRightPaneLines(theme Theme) []string {
 			rightPaneWidth = 30
 		}
 		
-		// Main title line with gradient
+		// Main title line with gradient. Pre-truncate the text to the pane width
+		// here so the later truncation in renderLibrary can't cut the trailing
+		// zone marker (which would break click detection for long rows).
+		mainText := prefix + icon + item.Title
+		if visualWidth(mainText) > rightPaneWidth {
+			mainText = truncateToWidth(mainText, rightPaneWidth-3) + "..."
+		}
 		mainStyle := createGradientStyle(selected, rightPaneWidth, theme)
-		mainLine := mainStyle.Render(prefix + icon + item.Title)
+		mainLine := zone.Mark(fmt.Sprintf("libitem_%d", i), mainStyle.Render(mainText))
 		allLines = append(allLines, mainLine)
 		
 		// Subtitle line if present
@@ -1804,7 +1902,8 @@ func (m model) renderFolderBrowser() string {
 
 	entries := m.folderBrowser.GetVisibleEntries()
 	selectedIndex := m.folderBrowser.GetVisibleSelectedIndex()
-	
+	viewportTop := m.folderBrowser.GetViewportTop()
+
 	// Calculate available width for folder browser
 	folderWidth := m.width - 4 // Account for padding
 	if folderWidth < 30 {
@@ -1815,24 +1914,29 @@ func (m model) renderFolderBrowser() string {
 		isSelected := i == selectedIndex
 		var prefix string
 		var icon string
-		
+
 		if entry == ".." || m.folderBrowser.IsDirectory(filepath.Join(m.folderBrowser.GetCurrentPath(), entry)) {
 			icon = "📁 "
 		} else {
 			icon = "📂 "
 		}
-		
+
 		if isSelected {
 			prefix = "> "
 		} else {
 			prefix = "  "
 		}
-		
-		// Create gradient style for selection
-		style := createGradientStyle(isSelected, folderWidth, theme)
-		displayText := prefix + icon + entry
 
-		items = append(items, style.Render(displayText))
+		// Pre-truncate to the pane width so the MaxWidth clip below can't cut the
+		// trailing zone marker.
+		displayText := prefix + icon + entry
+		if visualWidth(displayText) > folderWidth {
+			displayText = truncateToWidth(displayText, folderWidth-3) + "..."
+		}
+		style := createGradientStyle(isSelected, folderWidth, theme)
+		// Mark with the absolute entry index so clicks map to the right entry.
+		line := zone.Mark(fmt.Sprintf("folderitem_%d", viewportTop+i), style.Render(displayText))
+		items = append(items, line)
 	}
 
 	// Hard-clip every line to the terminal width so long paths or filenames
@@ -3369,9 +3473,10 @@ func (m model) centerChartContent(chartView string, chartWidth int) string {
 
 
 func main() {
+	zone.NewGlobal() // initialize the mouse-zone manager for clickable elements
 	m := initialModel()
 	defer m.audioPlayer.Close()
-	
+
 	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)

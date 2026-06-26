@@ -206,3 +206,18 @@ func (fb *FolderBrowser) GetVisibleEntries() []string {
 func (fb *FolderBrowser) GetVisibleSelectedIndex() int {
 	return fb.selected - fb.viewportTop
 }
+
+// GetViewportTop returns the index of the first visible entry (used to map a
+// clicked screen row back to an absolute entry index).
+func (fb *FolderBrowser) GetViewportTop() int {
+	return fb.viewportTop
+}
+
+// SetSelectedIndex selects the entry at index i. Used by mouse clicks.
+func (fb *FolderBrowser) SetSelectedIndex(i int) {
+	if i < 0 || i >= len(fb.entries) {
+		return
+	}
+	fb.selected = i
+	fb.adjustViewport()
+}

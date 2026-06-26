@@ -13,6 +13,7 @@ require (
 	github.com/go-audio/wav v1.1.0
 	github.com/gopxl/beep/v2 v2.1.1
 	github.com/jfreymuth/oggvorbis v1.0.5
+	github.com/lrstanley/bubblezone/v2 v2.0.0
 	github.com/mewkiz/flac v1.0.13
 	github.com/tcolgate/mp3 v0.0.0-20170426193717-e79c5a46d300
 )
@@ -34,7 +35,6 @@ require (
 	github.com/hajimehoshi/go-mp3 v0.3.4 // indirect
 	github.com/icza/bitio v1.1.0 // indirect
 	github.com/jfreymuth/vorbis v1.0.2 // indirect
-	github.com/lrstanley/bubblezone/v2 v2.0.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/mewkiz/pkg v0.0.0-20260331151047-10214ccde7de // indirect

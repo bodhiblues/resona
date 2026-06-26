@@ -266,6 +266,29 @@ func (lb *LibraryBrowser) MoveDown() {
 	}
 }
 
+// SetContentIndex selects the content item at index i and focuses the contents
+// pane. Used by mouse clicks.
+func (lb *LibraryBrowser) SetContentIndex(i int) {
+	if i < 0 || i >= len(lb.contents) {
+		return
+	}
+	lb.currentPane = "contents"
+	lb.contentIndex = i
+	lb.adjustContentViewport()
+}
+
+// SetCategoryIndex selects the category at index i and focuses the categories
+// pane. Used by mouse clicks.
+func (lb *LibraryBrowser) SetCategoryIndex(i int) {
+	if i < 0 || i >= len(lb.categories) {
+		return
+	}
+	lb.currentPane = "categories"
+	lb.categoryIndex = i
+	lb.updateCategoryType()
+	lb.adjustCategoryViewport()
+}
+
 func (lb *LibraryBrowser) SetViewportHeight(height int) {
 	// height is the exact number of visible content rows. The breadcrumb and
 	// items are all rendered within this window, so use it directly rather than
