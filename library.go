@@ -35,8 +35,8 @@ func scanMusicLibrary(rootPath string) ([]Song, error) {
 		".mp3":  true,
 		".flac": true,
 		".wav":  true,
-		".m4a":  true,
 		".ogg":  true,
+		// .m4a and .aac are not supported by the audio player
 	}
 
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {

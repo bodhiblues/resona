@@ -149,7 +149,10 @@ func NewAudioPlayer() (*AudioPlayer, error) {
 
 	// Initialize speaker with a reasonable sample rate
 	sr := beep.SampleRate(44100)
-	speaker.Init(sr, sr.N(time.Second/10))
+	if err := speaker.Init(sr, sr.N(time.Second/10)); err != nil {
+		log.Printf("DEBUG: speaker init failed: %v", err)
+		return nil, fmt.Errorf("failed to initialize audio output (is an audio server such as PipeWire/PulseAudio running?): %w", err)
+	}
 
 	// Create a mixer for better control
 	mixer := &beep.Mixer{}
@@ -169,8 +172,14 @@ func (ap *AudioPlayer) Play(filePath string) error {
 	
 	log.Printf("DEBUG: Playing %s (isURL: %v)", filePath, isURL)
 	
-	if !isURL && !ap.isFileSupported(filePath) {
-		return fmt.Errorf("unsupported file format: %s", filepath.Ext(filePath))
+	if !isURL {
+		ext := strings.ToLower(filepath.Ext(filePath))
+		if ext == ".aac" || ext == ".m4a" || ext == ".mp4" {
+			return fmt.Errorf("AAC/M4A format is not supported. Please use MP3, OGG, FLAC, or WAV files")
+		}
+		if !ap.isFileSupported(filePath) {
+			return fmt.Errorf("unsupported file format: %s", ext)
+		}
 	}
 
 	// Stop any current playback
@@ -314,6 +323,14 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	
 	log.Printf("DEBUG: Starting audio decoding")
 	if isURL {
+		// Check for AAC content type
+		if strings.Contains(contentType, "aac") || strings.Contains(contentType, "mp4") || 
+		   strings.Contains(contentType, "audio/aac") || strings.Contains(contentType, "audio/mp4") ||
+		   strings.Contains(contentType, "audio/x-aac") {
+			reader.Close()
+			return fmt.Errorf("AAC format is not supported for radio streams. Please find an MP3 or OGG stream URL for this station")
+		}
+		
 		// For URLs, try to detect format from Content-Type or assume MP3
 		// Try to decode based on content type, fallback to MP3
 		if strings.Contains(contentType, "ogg") || strings.Contains(contentType, "vorbis") {
@@ -346,6 +363,10 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	if err != nil {
 		log.Printf("DEBUG: Audio decoding failed: %v", err)
 		reader.Close()
+		// If MP3 decoding failed for a URL, it might be AAC
+		if isURL && strings.Contains(err.Error(), "mp3:") {
+			return fmt.Errorf("failed to decode stream - it may be using AAC format which is not supported. Please find an MP3 or OGG stream URL for this station")
+		}
 		return err
 	}
 	log.Printf("DEBUG: Audio decoding successful, format: %+v", format)

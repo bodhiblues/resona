@@ -1,0 +1,12 @@
+# Compiled binary (built via `go build -o resona .`)
+/resona
+
+# Stray / unrelated binaries
+/tuifi
+
+# Go build & test artifacts
+*.test
+*.out
+
+# Debug logs
+*.log
