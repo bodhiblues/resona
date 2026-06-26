@@ -29,32 +29,82 @@ type Song struct {
 	DurationSecs  float64 // Duration in seconds for calculations
 }
 
+// supportedAudioExts are the file extensions the audio player can decode.
+var supportedAudioExts = map[string]bool{
+	".mp3":  true,
+	".flac": true,
+	".wav":  true,
+	".ogg":  true,
+	// .m4a and .aac are not supported by the audio player
+}
+
+func isSupportedAudio(path string) bool {
+	return supportedAudioExts[strings.ToLower(filepath.Ext(path))]
+}
+
 func scanMusicLibrary(rootPath string) ([]Song, error) {
 	var songs []Song
-	supportedFormats := map[string]bool{
-		".mp3":  true,
-		".flac": true,
-		".wav":  true,
-		".ogg":  true,
-		// .m4a and .aac are not supported by the audio player
-	}
-
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-
-		if !info.IsDir() {
-			ext := strings.ToLower(filepath.Ext(path))
-			if supportedFormats[ext] {
-				song := extractMetadata(path)
-				songs = append(songs, song)
-			}
+		if !info.IsDir() && isSupportedAudio(path) {
+			songs = append(songs, extractMetadata(path))
 		}
 		return nil
 	})
-
 	return songs, err
+}
+
+// countAudioFiles returns the number of supported audio files under the given
+// folders. It only inspects directory entries (no file reads), so it is far
+// cheaper than a full metadata scan and lets us drive a determinate progress
+// bar.
+func countAudioFiles(folders []string) int {
+	total := 0
+	for _, folder := range folders {
+		filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && isSupportedAudio(path) {
+				total++
+			}
+			return nil
+		})
+	}
+	return total
+}
+
+// scanFoldersProgress scans the given folders for supported audio files and
+// extracts metadata for each. onProgress, if non-nil, is invoked after each
+// file with the running count and the precomputed total. It performs no shared
+// mutation, so it is safe to run from a goroutine (onProgress runs on that same
+// goroutine).
+func scanFoldersProgress(folders []string, onProgress func(done, total int)) []Song {
+	total := countAudioFiles(folders)
+	if onProgress != nil {
+		onProgress(0, total)
+	}
+
+	var songs []Song
+	done := 0
+	for _, folder := range folders {
+		filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && isSupportedAudio(path) {
+				songs = append(songs, extractMetadata(path))
+				done++
+				if onProgress != nil {
+					onProgress(done, total)
+				}
+			}
+			return nil
+		})
+	}
+	return songs
 }
 
 func getFilenameWithoutExt(filePath string) string {

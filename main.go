@@ -7,12 +7,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/NimbleMarkets/ntcharts/v2/barchart"
 	"github.com/NimbleMarkets/ntcharts/v2/linechart/wavelinechart"
 	"github.com/NimbleMarkets/ntcharts/v2/canvas"
 	"github.com/NimbleMarkets/ntcharts/v2/canvas/runes"
+	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -24,6 +26,42 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second/20, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// scanState holds the live progress of a library scan running on a background
+// goroutine. The scan goroutine writes via atomics; the UI goroutine reads them
+// on each scanTickMsg, so there is no shared-memory data race.
+type scanState struct {
+	done  atomic.Int64
+	total atomic.Int64
+}
+
+// scanTickMsg drives the progress-bar refresh while a scan is in flight.
+type scanTickMsg struct{}
+
+// scanDoneMsg is returned by the scan command when the background walk finishes.
+type scanDoneMsg struct {
+	mode   string // "add" or "rescan"
+	folder string // folder added, when mode == "add"
+	songs  []Song
+}
+
+func scanTickCmd() tea.Cmd {
+	return tea.Tick(time.Second/15, func(t time.Time) tea.Msg {
+		return scanTickMsg{}
+	})
+}
+
+// startScanCmd walks the given folders on a background goroutine, reporting
+// progress through st, and returns a scanDoneMsg when complete.
+func startScanCmd(folders []string, mode, folder string, st *scanState) tea.Cmd {
+	return func() tea.Msg {
+		songs := scanFoldersProgress(folders, func(done, total int) {
+			st.total.Store(int64(total))
+			st.done.Store(int64(done))
+		})
+		return scanDoneMsg{mode: mode, folder: folder, songs: songs}
+	}
 }
 
 type model struct {
@@ -63,6 +101,14 @@ type model struct {
 	// Visualizer
 	visualizer        barchart.Model
 	currentChartType  string // "unicode", "bars", "line", "wave", "sparkline", "heatmap"
+	// Library scan progress
+	scanning     bool
+	scanState    *scanState
+	scanPercent  float64
+	scanDone     int
+	scanTotal    int
+	scanLabel    string
+	scanProgress progress.Model
 }
 
 
@@ -130,6 +176,10 @@ func initialModel() model {
 		spinner:           s,
 		visualizer:        visualizer,
 		currentChartType:  "unicode", // Start with the high-res unicode visualizer
+		scanProgress: progress.New(progress.WithColors(
+			lipgloss.Color(settingsManager.GetTheme().Primary),
+			lipgloss.Color(settingsManager.GetTheme().Secondary),
+		)),
 	}
 	
 	// Reset viewport to ensure proper initial display
@@ -148,7 +198,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
-		
+
+	case scanTickMsg:
+		if m.scanning && m.scanState != nil {
+			m.scanDone = int(m.scanState.done.Load())
+			m.scanTotal = int(m.scanState.total.Load())
+			if m.scanTotal > 0 {
+				m.scanPercent = float64(m.scanDone) / float64(m.scanTotal)
+			}
+			return m, scanTickCmd()
+		}
+		return m, nil
+
+	case scanDoneMsg:
+		m.scanning = false
+		m.scanState = nil
+		m.scanPercent = 0
+		if msg.songs != nil || msg.mode == "rescan" {
+			switch msg.mode {
+			case "add":
+				m.libraryManager.AddFolderWithSongs(msg.folder, msg.songs)
+			case "rescan":
+				m.libraryManager.SetSongs(msg.songs)
+			}
+			m.libraryBrowser.Refresh()
+			m.currentView = "library"
+			m.selected = 0
+			m.libraryBrowser.ForceViewportReset()
+		}
+		return m, nil
+
 	case tickMsg:
 		// Check if current track has finished and auto-play next
 		if m.isTrackFinished() {
@@ -390,14 +469,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			if m.currentView == "folder" {
 				if selected := m.folderBrowser.GetSelected(); selected != "" {
-					if m.folderBrowser.IsDirectory(selected) {
-						// Add folder to library
-						if err := m.libraryManager.AddFolder(selected); err == nil {
-							m.libraryBrowser.Refresh()
-							m.currentView = "library"
-							m.selected = 0
-							m.libraryBrowser.ForceViewportReset()
-						}
+					if m.folderBrowser.IsDirectory(selected) && !m.scanning {
+						// Scan the folder on a background goroutine so the UI
+						// stays responsive and can show a progress bar.
+						m.scanning = true
+						m.scanState = &scanState{}
+						m.scanPercent = 0
+						m.scanDone, m.scanTotal = 0, 0
+						m.scanLabel = "Adding folder: " + selected
+						return m, tea.Batch(startScanCmd([]string{selected}, "add", selected, m.scanState), scanTickCmd())
 					}
 				}
 			} else if m.currentView == "radio" {
@@ -409,10 +489,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "r":
-			if m.currentView == "library" {
-				// Rescan library
-				m.libraryManager.RescanLibrary()
-				m.libraryBrowser.Refresh()
+			if m.currentView == "library" && !m.scanning {
+				// Rescan all library folders on a background goroutine.
+				if folders := m.libraryManager.GetFolders(); len(folders) > 0 {
+					m.scanning = true
+					m.scanState = &scanState{}
+					m.scanPercent = 0
+					m.scanDone, m.scanTotal = 0, 0
+					m.scanLabel = "Rescanning library…"
+					return m, tea.Batch(startScanCmd(folders, "rescan", "", m.scanState), scanTickCmd())
+				}
 			}
 			return m, nil
 		case "tab":
@@ -586,6 +672,42 @@ func (m model) View() tea.View {
 	return v
 }
 
+// renderScanningView renders a centered progress panel shown while a library
+// scan runs on a background goroutine, so a large library no longer looks like
+// a frozen app.
+func (m model) renderScanningView(height int) string {
+	theme := m.settingsManager.GetTheme()
+
+	barWidth := m.width - 20
+	if barWidth > 60 {
+		barWidth = 60
+	}
+	if barWidth < 10 {
+		barWidth = 10
+	}
+	prog := m.scanProgress
+	prog.SetWidth(barWidth)
+	bar := prog.ViewAs(m.scanPercent)
+
+	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary)).Bold(true)
+	countStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+
+	count := fmt.Sprintf("%d / %d tracks", m.scanDone, m.scanTotal)
+	if m.scanTotal == 0 {
+		count = "Counting tracks…"
+	}
+
+	panel := lipgloss.JoinVertical(lipgloss.Center,
+		titleStyle.Render(m.spinner.View()+" "+m.scanLabel),
+		"",
+		bar,
+		"",
+		countStyle.Render(count),
+	)
+
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, panel)
+}
+
 func (m model) renderView() string {
 	// Calculate fixed component heights
 	headerHeight := 1
@@ -635,7 +757,12 @@ func (m model) renderView() string {
 	tabs := m.renderTabs()
 	
 	// Render main content with viewport
-	content := m.renderMainContent(availableHeight)
+	var content string
+	if m.scanning {
+		content = m.renderScanningView(availableHeight)
+	} else {
+		content = m.renderMainContent(availableHeight)
+	}
 	
 	// Render status
 	playStatus := "⏹️  Stopped"

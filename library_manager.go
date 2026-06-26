@@ -185,6 +185,51 @@ func (lm *LibraryManager) RescanLibrary() error {
 	return lm.SaveLibrary()
 }
 
+// mergeSongs adds the given songs to the library, skipping any whose file path
+// is already present, then sorts the library by title. Dedup is O(n) via a map.
+func (lm *LibraryManager) mergeSongs(scanned []Song) {
+	existing := make(map[string]bool, len(lm.songs))
+	for _, s := range lm.songs {
+		existing[s.FilePath] = true
+	}
+	for _, s := range scanned {
+		if s.FilePath != "" && !existing[s.FilePath] {
+			lm.songs = append(lm.songs, s)
+			existing[s.FilePath] = true
+		}
+	}
+	sort.Slice(lm.songs, func(i, j int) bool {
+		return strings.ToLower(lm.songs[i].Title) < strings.ToLower(lm.songs[j].Title)
+	})
+}
+
+// AddFolderWithSongs registers folderPath and merges pre-scanned songs into the
+// library. Used by the asynchronous (progress-reporting) scan path so the slow
+// filesystem walk happens off the UI goroutine.
+func (lm *LibraryManager) AddFolderWithSongs(folderPath string, scanned []Song) error {
+	exists := false
+	for _, folder := range lm.folders {
+		if folder == folderPath {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		lm.folders = append(lm.folders, folderPath)
+		sort.Strings(lm.folders)
+	}
+	lm.mergeSongs(scanned)
+	return lm.SaveLibrary()
+}
+
+// SetSongs replaces the library's songs with the given pre-scanned set; folders
+// are left unchanged. Used by the asynchronous rescan path.
+func (lm *LibraryManager) SetSongs(scanned []Song) error {
+	lm.songs = nil
+	lm.mergeSongs(scanned)
+	return lm.SaveLibrary()
+}
+
 func (lm *LibraryManager) GetSongs() []Song {
 	if len(lm.songs) == 0 {
 		return []Song{
