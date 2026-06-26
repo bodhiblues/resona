@@ -8,6 +8,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.4
 	github.com/NimbleMarkets/ntcharts/v2 v2.2.0
 	github.com/abema/go-mp4 v1.7.1
+	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/go-audio/wav v1.1.0
 	github.com/gopxl/beep/v2 v2.1.1
@@ -20,7 +21,6 @@ require (
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/harmonica v0.2.0 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260525132238-948f4557a654 // indirect
-	github.com/charmbracelet/x/ansi v0.11.7 // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect
 	github.com/charmbracelet/x/windows v0.2.2 // indirect

@@ -14,6 +14,7 @@ import (
 	"github.com/NimbleMarkets/ntcharts/v2/linechart/wavelinechart"
 	"github.com/NimbleMarkets/ntcharts/v2/canvas"
 	"github.com/NimbleMarkets/ntcharts/v2/canvas/runes"
+	"github.com/charmbracelet/x/ansi"
 	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -711,13 +712,17 @@ func (m model) renderScanningView(height int) string {
 func (m model) renderView() string {
 	// Calculate fixed component heights
 	headerHeight := 1
-	tabsHeight := 1
+	// Tabs are bordered (3 rows tall), so measure the real height instead of
+	// assuming 1 — otherwise the content area is over-estimated and the bottom
+	// rows (including the selection) get truncated by the topSection MaxHeight.
+	tabs := m.renderTabs()
+	tabsHeight := lipgloss.Height(tabs)
 	statusHeight := 1
 	nowPlayingHeight := 0
 	if m.playingSong != nil || m.playingStation != nil {
-		nowPlayingHeight = 10 // Height for now playing box
+		nowPlayingHeight = m.calculateNowPlayingHeight()
 	}
-	
+
 	// Calculate content viewport height
 	// Account for all fixed elements plus spacing
 	spacing := 3 // Spacing between sections
@@ -728,7 +733,16 @@ func (m model) renderView() string {
 	if availableHeight < 5 {
 		availableHeight = 5
 	}
-	
+
+	// Keep the scrollable browsers sized to exactly this visible content area on
+	// every frame — including when the now-playing box appears or disappears —
+	// so the selected row can never scroll off-screen. The browsers are
+	// pointers, so these updates persist.
+	m.libraryBrowser.SetViewportHeight(availableHeight)
+	// The folder view renders a 2-line header (current path + blank) above its
+	// entries, so give it two fewer rows to keep the selection on-screen.
+	m.folderBrowser.SetViewportHeight(availableHeight - 2)
+
 	// Render fixed components
 	theme := m.settingsManager.GetTheme()
 	headerStyle := lipgloss.NewStyle().
@@ -753,9 +767,14 @@ func (m model) renderView() string {
 	} else {
 		headerText += fmt.Sprintf(" - Browse: %s", m.folderBrowser.GetCurrentPath())
 	}
-	header := headerStyle.Render(headerText)
-	tabs := m.renderTabs()
-	
+	// Truncate the header so a long breadcrumb or browse path can't overflow the
+	// terminal width (headerStyle adds PaddingLeft(2)).
+	maxHeaderWidth := m.width - 2
+	if maxHeaderWidth < 1 {
+		maxHeaderWidth = 1
+	}
+	header := headerStyle.Render(ansi.Truncate(headerText, maxHeaderWidth, "…"))
+
 	// Render main content with viewport
 	var content string
 	if m.scanning {
@@ -765,11 +784,11 @@ func (m model) renderView() string {
 	}
 	
 	// Render status
-	playStatus := "⏹️  Stopped"
+	playStatus := "⏹  Stopped"
 	if m.audioPlayer.IsPlaying() {
-		playStatus = "▶️  Playing"
+		playStatus = "▶  Playing"
 	} else if m.audioPlayer.IsPaused() {
-		playStatus = "⏸️  Paused"
+		playStatus = "⏸  Paused"
 	}
 	
 	var controlsText string
@@ -851,12 +870,16 @@ func (m model) renderView() string {
 	)
 	
 	// Overlay search if active
+	view := mainView
 	if m.searchMode {
-		searchOverlay := m.renderSearch()
-		return searchOverlay
+		view = m.renderSearch()
 	}
-	
-	return mainView
+
+	// Final safety net: hard-clip every line to the terminal width so that any
+	// long content (status help text, radio rows, deep paths, …) can't wrap onto
+	// a second visual row and break the layout. The per-component truncation
+	// above keeps things tidy with ellipses; this just guarantees correctness.
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(view)
 }
 
 func (m model) renderTabs() string {
@@ -1092,9 +1115,12 @@ func (m model) calculateNowPlayingHeight() int {
 	if m.playingSong == nil && m.playingStation == nil {
 		return 0
 	}
-	
-	// Fixed height for now playing section
-	return 10
+
+	// Height of the rendered now-playing box. renderNowPlaying emits 7 content
+	// lines (title, blank, song info, blank, progress bar, blank, controls) plus
+	// one line of vertical padding and one border line at the top and bottom:
+	// 7 + 2 + 2 = 11. Must stay in sync with renderNowPlaying.
+	return 11
 }
 
 func (m model) renderNowPlaying() string {
@@ -1131,15 +1157,15 @@ func (m model) renderNowPlaying() string {
 	}
 	
 	// Control buttons - simpler, cleaner approach
-	controls := []string{"⏮️", "⏯️", "⏭️", "⏹️"}
+	controls := []string{"⏮", "⏯", "⏭", "⏹"}
 	controlLabels := []string{"Prev", "Play", "Next", "Stop"}
 	
 	// Adjust play/pause button based on current state
 	if m.audioPlayer.IsPlaying() {
-		controls[1] = "⏸️"
+		controls[1] = "⏸"
 		controlLabels[1] = "Pause"
 	} else {
-		controls[1] = "▶️"
+		controls[1] = "▶"
 		controlLabels[1] = "Play"
 	}
 	
@@ -1182,17 +1208,19 @@ func (m model) renderNowPlaying() string {
 		totalWidth = 40
 	}
 	
-	// Calculate the exact inner content width
-	innerWidth := totalWidth - 4 // Account for "│ " and " │"
-	
+	// lipgloss Width() is the outer box width (border + padding included). With a
+	// 1-cell rounded border and 2-cell horizontal padding on each side, the inner
+	// content area is totalWidth - 2 (border) - 4 (padding) = totalWidth - 6.
+	innerWidth := totalWidth - 6
+
 	// Progress bar
 	progressBar := m.renderProgressBar(innerWidth)
-	
+
 	// Create a unified style that handles the entire box
 	boxStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(theme.Border)).
-		Width(totalWidth - 2).
+		Width(totalWidth).
 		Padding(1, 2)
 	
 	// Build content without borders - let lipgloss handle the box
@@ -1232,7 +1260,7 @@ func (m model) renderProgressBar(width int) string {
 		// Check if radio is paused
 		if m.audioPlayer.IsPaused() {
 			// Radio is paused - show paused state
-			displayStr := "⏸️  Paused"
+			displayStr := "⏸  Paused"
 			return lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted)).Render(displayStr)
 		}
 		
@@ -1269,20 +1297,18 @@ func (m model) renderProgressBar(width int) string {
 	
 	timeStr := positionStr + " / " + durationStr
 	
-	// Reserve space for visualizer and time display
+	// Reserve space for visualizer and time display. The rendered line is
+	// bar + " " + time + " " + visualizer, i.e. exactly two single-space gaps, so
+	// reserving more than that pushes the line past the box's content area.
 	visualizerWidth := 24
 	timeWidth := len(timeStr)
-	reservedSpace := visualizerWidth + timeWidth + 4 // 4 for spacing between components
-	
-	// Calculate progress bar width (remaining space after reserving for visualizer and time)
+	reservedSpace := visualizerWidth + timeWidth + 2
+
+	// Calculate progress bar width from the remaining space so the whole line
+	// fits exactly within the now-playing box's content area.
 	barWidth := width - reservedSpace
 	if barWidth < 10 {
 		barWidth = 10
-	}
-	
-	// Increase resolution for smoother updates - use a minimum width for better granularity
-	if barWidth < 50 {
-		barWidth = 50
 	}
 	
 	// Create gradient progress bar with higher resolution simulation
@@ -1482,21 +1508,9 @@ func max(a, b int) int {
 
 // Calculate visual width of string excluding ANSI color codes
 func visualWidth(s string) int {
-	// Simple regex to remove ANSI escape sequences
-	width := 0
-	inEscape := false
-	
-	for _, r := range s {
-		if r == '\033' { // Start of ANSI escape sequence
-			inEscape = true
-		} else if inEscape && r == 'm' { // End of ANSI escape sequence
-			inEscape = false
-		} else if !inEscape {
-			width++
-		}
-	}
-	
-	return width
+	// Display width, ignoring ANSI escape sequences and correctly counting
+	// wide characters (emoji, CJK) as 2 cells.
+	return ansi.StringWidth(s)
 }
 
 // Pad string to specific visual width (accounting for ANSI codes)
@@ -1511,29 +1525,12 @@ func padToWidth(s string, width int) string {
 
 // Truncate string to specific visual width while preserving ANSI codes
 func truncateToWidth(s string, maxWidth int) string {
-	width := 0
-	inEscape := false
-	var result strings.Builder
-	
-	for _, r := range s {
-		if r == '\033' { // Start of ANSI escape sequence
-			inEscape = true
-			result.WriteRune(r)
-		} else if inEscape {
-			result.WriteRune(r)
-			if r == 'm' { // End of ANSI escape sequence
-				inEscape = false
-			}
-		} else {
-			if width >= maxWidth {
-				break
-			}
-			result.WriteRune(r)
-			width++
-		}
+	if maxWidth < 0 {
+		maxWidth = 0
 	}
-	
-	return result.String()
+	// Display-width-aware truncation that preserves ANSI styling and accounts
+	// for wide characters.
+	return ansi.Truncate(s, maxWidth, "")
 }
 
 func (m model) getLeftPaneLines(theme Theme) []string {
@@ -1832,14 +1829,15 @@ func (m model) renderFolderBrowser() string {
 		}
 		
 		// Create gradient style for selection
-		theme := m.settingsManager.GetTheme()
 		style := createGradientStyle(isSelected, folderWidth, theme)
 		displayText := prefix + icon + entry
-		
+
 		items = append(items, style.Render(displayText))
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, items...)
+	// Hard-clip every line to the terminal width so long paths or filenames
+	// can't wrap onto a second visual row and push the selection off-screen.
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(lipgloss.JoinVertical(lipgloss.Left, items...))
 }
 
 func (m model) renderSearch() string {
@@ -2708,7 +2706,7 @@ func (m model) renderSettingsConfirmClearMusic() string {
 		Background(lipgloss.Color(theme.Error)).
 		PaddingLeft(2)
 	
-	items = append(items, headerStyle.Render("⚠️  Clear Music Library"))
+	items = append(items, headerStyle.Render("⚠  Clear Music Library"))
 	items = append(items, "")
 	items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Foreground)).Render("Are you sure you want to clear your entire music library?"))
 	items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted)).Render("This will remove all songs and folder references."))
@@ -2749,7 +2747,7 @@ func (m model) renderSettingsConfirmClearRadio() string {
 		Background(lipgloss.Color(theme.Error)).
 		PaddingLeft(2)
 	
-	items = append(items, headerStyle.Render("⚠️  Clear Radio Library"))
+	items = append(items, headerStyle.Render("⚠  Clear Radio Library"))
 	items = append(items, "")
 	items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Foreground)).Render("Are you sure you want to clear your entire radio library?"))
 	items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted)).Render("This will remove all saved radio stations."))

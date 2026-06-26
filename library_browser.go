@@ -267,15 +267,16 @@ func (lb *LibraryBrowser) MoveDown() {
 }
 
 func (lb *LibraryBrowser) SetViewportHeight(height int) {
-	// Reserve space for header and status
-	viewportHeight := height - 6
-	if viewportHeight < 5 {
-		viewportHeight = 5
+	// height is the exact number of visible content rows. The breadcrumb and
+	// items are all rendered within this window, so use it directly rather than
+	// reserving a fixed amount that drifts out of sync with the renderer.
+	if height < 1 {
+		height = 1
 	}
-	
-	lb.categoryViewport.height = viewportHeight
-	lb.contentViewport.height = viewportHeight
-	
+
+	lb.categoryViewport.height = height
+	lb.contentViewport.height = height
+
 	lb.adjustCategoryViewport()
 	lb.adjustContentViewport()
 }
