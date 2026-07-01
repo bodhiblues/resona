@@ -9,13 +9,14 @@ import (
 
 type LibraryBrowser struct {
 	currentPane      string // "categories" or "contents"
-	categoryType     string // "artists", "albums", "genres"
+	categoryType     string // "artists", "albums", "genres", "playlists"
 	categories       []string
 	contents         []LibraryItem
 	categoryIndex    int
 	contentIndex     int
 	breadcrumb       []string // Track navigation path
 	libraryManager   *LibraryManager
+	playlistManager  *PlaylistManager
 	categoryViewport viewport
 	contentViewport  viewport
 }
@@ -26,17 +27,18 @@ type viewport struct {
 }
 
 type LibraryItem struct {
-	Type     string // "artist", "album", "song"
+	Type     string // "artist", "album", "song", "genre", "playlist"
 	Title    string
 	Subtitle string // For albums: artist, for songs: artist - album
 	Song     *Song  // Only for song items
 }
 
-func NewLibraryBrowser(libraryManager *LibraryManager) *LibraryBrowser {
+func NewLibraryBrowser(libraryManager *LibraryManager, playlistManager *PlaylistManager) *LibraryBrowser {
 	lb := &LibraryBrowser{
 		currentPane:      "contents", // Start in contents pane
 		categoryType:     "artists",
 		libraryManager:   libraryManager,
+		playlistManager:  playlistManager,
 		categoryIndex:    0,
 		contentIndex:     0,
 		breadcrumb:       []string{},
@@ -51,8 +53,8 @@ func NewLibraryBrowser(libraryManager *LibraryManager) *LibraryBrowser {
 }
 
 func (lb *LibraryBrowser) refreshCategories() {
-	lb.categories = []string{"Artists", "Albums", "Genres"}
-	
+	lb.categories = []string{"Artists", "Albums", "Genres", "Playlists"}
+
 	// Set categoryIndex based on current categoryType
 	switch lb.categoryType {
 	case "artists":
@@ -61,10 +63,22 @@ func (lb *LibraryBrowser) refreshCategories() {
 		lb.categoryIndex = 1
 	case "genres":
 		lb.categoryIndex = 2
+	case "playlists":
+		lb.categoryIndex = 3
 	}
 }
 
 func (lb *LibraryBrowser) refreshContents() {
+	// Playlists don't depend on the scanned library, so build them before the
+	// empty-library guard below.
+	if lb.categoryType == "playlists" {
+		lb.contents = lb.getPlaylists()
+		if lb.contentIndex >= len(lb.contents) {
+			lb.contentIndex = 0
+		}
+		return
+	}
+
 	songs := lb.libraryManager.GetSongs()
 	if len(songs) == 0 {
 		lb.contents = []LibraryItem{
@@ -72,7 +86,7 @@ func (lb *LibraryBrowser) refreshContents() {
 		}
 		return
 	}
-	
+
 	switch lb.categoryType {
 	case "artists":
 		lb.contents = lb.getArtists(songs)
@@ -81,10 +95,119 @@ func (lb *LibraryBrowser) refreshContents() {
 	case "genres":
 		lb.contents = lb.getGenres(songs)
 	}
-	
+
 	if lb.contentIndex >= len(lb.contents) {
 		lb.contentIndex = 0
 	}
+}
+
+// getPlaylists builds the top-level playlist list.
+func (lb *LibraryBrowser) getPlaylists() []LibraryItem {
+	playlists := lb.playlistManager.GetPlaylists()
+	if len(playlists) == 0 {
+		return []LibraryItem{
+			{Type: "empty", Title: "No playlists yet", Subtitle: "Add tracks with Ctrl+P, or press n to create one"},
+		}
+	}
+	var items []LibraryItem
+	for _, p := range playlists {
+		items = append(items, LibraryItem{
+			Type:     "playlist",
+			Title:    p.Name,
+			Subtitle: playlistCountLabel(len(p.Songs)),
+		})
+	}
+	return items
+}
+
+// drillDownToPlaylist shows the songs in the named playlist.
+func (lb *LibraryBrowser) drillDownToPlaylist(name string) *Song {
+	songs := lb.playlistManager.SongsOf(name)
+	var items []LibraryItem
+	for i := range songs {
+		s := songs[i]
+		items = append(items, LibraryItem{
+			Type:     "song",
+			Title:    s.Title,
+			Subtitle: s.Artist + " - " + s.Album,
+			Song:     &s,
+		})
+	}
+	lb.contents = items
+	lb.contentIndex = 0
+	lb.breadcrumb = []string{name}
+	return nil
+}
+
+// CurrentPlaylistName returns the playlist being viewed, or "" if not drilled
+// into one.
+func (lb *LibraryBrowser) CurrentPlaylistName() string {
+	if lb.categoryType == "playlists" && len(lb.breadcrumb) == 1 {
+		return lb.breadcrumb[0]
+	}
+	return ""
+}
+
+// SongsForSelected returns all songs represented by the highlighted content
+// item — a single song, or every song of an artist/album/genre/playlist.
+func (lb *LibraryBrowser) SongsForSelected() []Song {
+	if lb.currentPane != "contents" || lb.contentIndex >= len(lb.contents) {
+		return nil
+	}
+	item := lb.contents[lb.contentIndex]
+	switch item.Type {
+	case "song":
+		if item.Song != nil {
+			return []Song{*item.Song}
+		}
+	case "playlist":
+		return lb.playlistManager.SongsOf(item.Title)
+	case "artist":
+		return filterSongs(lb.libraryManager.GetSongs(), func(s Song) bool {
+			return fieldOrUnknown(s.Artist, "Unknown Artist") == item.Title
+		})
+	case "genre":
+		return filterSongs(lb.libraryManager.GetSongs(), func(s Song) bool {
+			return fieldOrUnknown(s.Genre, "Unknown Genre") == item.Title
+		})
+	case "album":
+		artist := strings.Split(item.Subtitle, " • ")[0]
+		return filterSongs(lb.libraryManager.GetSongs(), func(s Song) bool {
+			return fieldOrUnknown(s.Artist, "Unknown Artist") == artist &&
+				fieldOrUnknown(s.Album, "Unknown Album") == item.Title
+		})
+	}
+	return nil
+}
+
+// SelectedLabel describes the highlighted content item for the picker header
+// (a song title, or "<name> (N songs)" for a group/playlist).
+func (lb *LibraryBrowser) SelectedLabel() string {
+	if lb.currentPane != "contents" || lb.contentIndex >= len(lb.contents) {
+		return ""
+	}
+	item := lb.contents[lb.contentIndex]
+	if item.Type == "song" {
+		return item.Title
+	}
+	return fmt.Sprintf("%s (%s)", item.Title, playlistCountLabel(len(lb.SongsForSelected())))
+}
+
+func fieldOrUnknown(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func filterSongs(songs []Song, keep func(Song) bool) []Song {
+	var out []Song
+	for _, s := range songs {
+		if keep(s) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (lb *LibraryBrowser) getArtists(songs []Song) []LibraryItem {
@@ -358,6 +481,8 @@ func (lb *LibraryBrowser) updateCategoryType() {
 		lb.categoryType = "albums"
 	case 2:
 		lb.categoryType = "genres"
+	case 3:
+		lb.categoryType = "playlists"
 	}
 	lb.contentIndex = 0
 	lb.breadcrumb = []string{}
@@ -378,10 +503,12 @@ func (lb *LibraryBrowser) EnterSelected() *Song {
 		return lb.drillDownToAlbum(selected.Title, selected.Subtitle)
 	case "genre":
 		return lb.drillDownToGenre(selected.Title)
+	case "playlist":
+		return lb.drillDownToPlaylist(selected.Title)
 	case "song":
 		return selected.Song
 	}
-	
+
 	return nil
 }
 

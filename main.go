@@ -78,6 +78,7 @@ type model struct {
 	audioPlayer       *AudioPlayer
 	folderBrowser     *FolderBrowser
 	libraryManager    *LibraryManager
+	playlistManager   *PlaylistManager
 	libraryBrowser    *LibraryBrowser
 	radioLibrary      *RadioLibrary
 	radioBrowser      *RadioBrowser
@@ -91,6 +92,20 @@ type model struct {
 	searchCategory    string // "songs", "artists", "albums", "genres"
 	searchResults     []searchResult
 	searchSelected    int
+	// Add-to-playlist picker (shared modal overlay, opened via ctrl+p)
+	playlistPicker       bool
+	playlistPickerIndex  int
+	playlistPickerSongs  []Song
+	playlistPickerLabel  string
+	playlistPickerSource string // "search", "library", "nowplaying"
+	playlistPickerScope  string // "selected", "all" (search source only)
+	// Inline text prompt (new playlist name / rename) and delete confirm
+	textInputActive       bool
+	textInputBuffer       string
+	textInputPurpose      string // "new-playlist-add", "new-playlist-empty", "rename-playlist"
+	playlistRenameTarget  string // playlist being renamed
+	playlistConfirmDelete bool
+	statusFlash           string // transient confirmation message
 	// Main content viewport
 	contentViewport   viewport
 	contentLines      []string
@@ -134,8 +149,14 @@ func initialModel() model {
 		fmt.Printf("Error initializing library manager: %v\n", err)
 		os.Exit(1)
 	}
-	
-	libraryBrowser := NewLibraryBrowser(libraryManager)
+
+	playlistManager, err := NewPlaylistManager()
+	if err != nil {
+		fmt.Printf("Error initializing playlist manager: %v\n", err)
+		os.Exit(1)
+	}
+
+	libraryBrowser := NewLibraryBrowser(libraryManager, playlistManager)
 	
 	radioLibrary, err := NewRadioLibrary()
 	if err != nil {
@@ -170,6 +191,7 @@ func initialModel() model {
 		audioPlayer:       audioPlayer,
 		folderBrowser:     folderBrowser,
 		libraryManager:    libraryManager,
+		playlistManager:   playlistManager,
 		libraryBrowser:    libraryBrowser,
 		radioLibrary:      radioLibrary,
 		radioBrowser:      radioBrowser,
@@ -288,7 +310,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		keyStr := msg.String()
-		
+
+		// A transient confirmation only lasts until the next keypress.
+		m.statusFlash = ""
+
+		// Inline text prompt (naming/renaming a playlist) captures all input.
+		if m.textInputActive {
+			switch keyStr {
+			case "enter":
+				m.commitTextInput()
+			case "esc":
+				m.cancelTextInput()
+			case "backspace":
+				if len(m.textInputBuffer) > 0 {
+					m.textInputBuffer = m.textInputBuffer[:len(m.textInputBuffer)-1]
+				}
+			case "space", " ":
+				m.textInputBuffer += " "
+			default:
+				if len(keyStr) == 1 && keyStr[0] >= 32 && keyStr[0] <= 126 {
+					m.textInputBuffer += keyStr
+				}
+			}
+			return m, nil
+		}
+
+		// The add-to-playlist picker is modal over any view.
+		if m.playlistPicker {
+			return m.handlePlaylistPickerKey(keyStr)
+		}
+
+		// Delete-playlist confirmation: y deletes, any other key cancels.
+		if m.playlistConfirmDelete {
+			m.playlistConfirmDelete = false
+			if keyStr == "y" {
+				if name := m.selectedLibraryPlaylistName(); name != "" {
+					m.playlistManager.Delete(name)
+					m.refreshPlaylistListIfShown()
+					m.statusFlash = fmt.Sprintf("Deleted \"%s\"", name)
+				}
+			}
+			return m, nil
+		}
+
 		// Handle radio input mode first (prevent function keys from working during text input)
 		if m.currentView == "radio" && m.radioBrowser.IsInputMode() {
 			switch keyStr {
@@ -309,7 +373,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		
+
+		// Ctrl+P opens the add-to-playlist picker from anywhere (search result,
+		// selected library item, or the currently-playing track).
+		if keyStr == "ctrl+p" {
+			m.openPlaylistPicker()
+			return m, nil
+		}
+
 		// Handle search mode
 		if m.searchMode {
 			switch keyStr {
@@ -449,6 +520,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tickCmd()
 					}
 				}
+			} else if m.currentView == "library" && m.libraryBrowser.GetCategoryType() == "playlists" {
+				// Play the whole selected/open playlist.
+				name := m.selectedLibraryPlaylistName()
+				if name == "" {
+					name = m.libraryBrowser.CurrentPlaylistName()
+				}
+				if songs := m.playlistManager.SongsOf(name); len(songs) > 0 {
+					m.setPlaylist(songs, 0)
+					if m.playCurrentTrack() {
+						return m, tickCmd()
+					}
+				}
 			}
 			return m, nil
 		case "f":
@@ -520,6 +603,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scanDone, m.scanTotal = 0, 0
 					m.scanLabel = "Rescanning library…"
 					return m, tea.Batch(startScanCmd(folders, "rescan", "", m.scanState), scanTickCmd())
+				}
+			}
+			return m, nil
+		case "n":
+			// New (empty) playlist — only at the Playlists top level.
+			if m.currentView == "library" && m.libraryBrowser.GetCategoryType() == "playlists" &&
+				len(m.libraryBrowser.GetBreadcrumb()) == 0 {
+				m.startTextInput("new-playlist-empty", "")
+			}
+			return m, nil
+		case "e":
+			// Rename the selected playlist.
+			if m.currentView == "library" && m.libraryBrowser.GetCategoryType() == "playlists" {
+				if name := m.selectedLibraryPlaylistName(); name != "" {
+					m.playlistRenameTarget = name
+					m.startTextInput("rename-playlist", name)
+				}
+			}
+			return m, nil
+		case "d":
+			// Delete the selected playlist (asks for confirmation).
+			if m.currentView == "library" && m.libraryBrowser.GetCategoryType() == "playlists" {
+				if m.selectedLibraryPlaylistName() != "" {
+					m.playlistConfirmDelete = true
+				}
+			}
+			return m, nil
+		case "x":
+			// Remove the highlighted song from the open playlist.
+			if m.currentView == "library" {
+				if name := m.libraryBrowser.CurrentPlaylistName(); name != "" {
+					contents := m.libraryBrowser.GetContents()
+					idx := m.libraryBrowser.GetContentIndex()
+					if idx < len(contents) && contents[idx].Song != nil {
+						m.playlistManager.RemoveSong(name, contents[idx].Song.FilePath)
+						m.libraryBrowser.drillDownToPlaylist(name)
+						m.statusFlash = fmt.Sprintf("Removed from \"%s\"", name)
+					}
 				}
 			}
 			return m, nil
@@ -805,8 +926,14 @@ func (m model) renderView() string {
 	} else if m.currentView == "library" {
 		if m.libraryBrowser.GetCurrentPane() == "categories" {
 			controlsText = "↑/↓ navigate categories, tab to switch panes, enter/space to pause, shift+tab for controls, / to search, f for folder browser, r to rescan, q to quit"
+		} else if m.libraryBrowser.GetCategoryType() == "playlists" {
+			if m.libraryBrowser.CurrentPlaylistName() != "" {
+				controlsText = "↑/↓ navigate, enter to play, x remove track, backspace to go back, ^P add to playlist, / search, q quit"
+			} else {
+				controlsText = "↑/↓ navigate, enter to open, p play, n new, e rename, d delete, ^P add, / search, q quit"
+			}
 		} else {
-			controlsText = "↑/↓ navigate, enter to select/play, backspace to go back, tab to switch panes, shift+tab for controls, / to search, f for folder browser, q to quit"
+			controlsText = "↑/↓ navigate, enter to select/play, backspace to go back, tab to switch panes, ^P add to playlist, / search, f folder browser, q quit"
 		}
 	} else if m.currentView == "radio" {
 		if m.radioBrowser.GetCurrentView() == "add" {
@@ -828,10 +955,20 @@ func (m model) renderView() string {
 		controlsText = "↑/↓ navigate, enter to open, a to add folder to library, backspace to go back, / to search, f for library, q to quit"
 	}
 	
-	status := statusStyle.Render(fmt.Sprintf("Playing: %s | %s | %s", 
-		m.playing, 
+	// A pending delete confirmation or transient flash takes over the help slot.
+	statusText := controlsText
+	if m.playlistConfirmDelete {
+		if name := m.selectedLibraryPlaylistName(); name != "" {
+			statusText = fmt.Sprintf("Delete \"%s\"?  y = yes, any other key = no", name)
+		}
+	} else if m.statusFlash != "" {
+		statusText = m.statusFlash
+	}
+
+	status := statusStyle.Render(fmt.Sprintf("Playing: %s | %s | %s",
+		m.playing,
 		playStatus,
-		controlsText))
+		statusText))
 
 	// Build the layout with fixed positioning
 	// Top section (header + tabs + content)
@@ -883,11 +1020,19 @@ func (m model) renderView() string {
 	// things tidy with ellipses; this just guarantees correctness.
 	mainView = lipgloss.NewStyle().MaxWidth(m.width).Render(mainView)
 
-	// Overlay search if active: float the modal over a dimmed copy of the app.
+	// Overlay modals over a dimmed copy of the app. When the picker sits on top
+	// of the search modal, the search view is already dimmed — don't dim twice.
+	view := mainView
 	if m.searchMode {
-		return m.renderSearch(mainView)
+		view = m.renderSearch(view)
 	}
-	return mainView
+	if m.playlistPicker {
+		view = m.renderPlaylistPicker(view, !m.searchMode)
+	} else if m.textInputActive {
+		// New/rename prompt opened from the Library (no picker behind it).
+		view = m.renderTextPrompt(view)
+	}
+	return view
 }
 
 func (m model) renderTabs() string {
@@ -1732,6 +1877,8 @@ func (m model) getRightPaneLines(theme Theme) []string {
 			icon = "💿 "
 		case "genre":
 			icon = "🎭 "
+		case "playlist":
+			icon = "🎵 "
 		case "song":
 			icon = "♪ "
 		default:
@@ -1897,6 +2044,8 @@ func (m model) renderRightPane(width int) string {
 			icon = "💿 "
 		case "genre":
 			icon = "🎭 "
+		case "playlist":
+			icon = "🎵 "
 		case "song":
 			icon = "♪ "
 		default:
@@ -2083,8 +2232,13 @@ func (m model) renderSearch(background string) string {
 	resultLines = append(resultLines, helpStyle.Render(ansi.Truncate(help, innerWidth, "…")))
 
 	box := searchBoxStyle.Render(strings.Join(resultLines, "\n"))
+	return m.compositeCentered(background, box, true)
+}
 
-	// Composite the modal over a dimmed copy of the app using lipgloss layers.
+// compositeCentered draws box centered over background using lipgloss layers.
+// When dim is true the background is faded first (the modal scrim); when false
+// it is left untouched (e.g. stacking a picker over the already-dimmed search).
+func (m model) compositeCentered(background, box string, dim bool) string {
 	boxW, boxH := lipgloss.Width(box), lipgloss.Height(box)
 	x := (m.width - boxW) / 2
 	y := (m.height - boxH) / 2
@@ -2097,11 +2251,123 @@ func (m model) renderSearch(background string) string {
 
 	canvas := lipgloss.NewCanvas(m.width, m.height)
 	canvas.Compose(lipgloss.NewLayer(background)) // paint the app across the canvas
-	m.dimCanvas(canvas)                           // fade it toward the background
+	if dim {
+		m.dimCanvas(canvas) // fade it toward the background
+	}
 	// A bare Layer's X/Y offset is only applied by a Compositor (Layer.Draw
 	// itself ignores it), so wrap the modal in one to place it at (x, y).
 	canvas.Compose(lipgloss.NewCompositor(lipgloss.NewLayer(box).X(x).Y(y)))
 	return canvas.Render()
+}
+
+// renderPlaylistPicker draws the add-to-playlist modal (＋ New playlist… plus
+// existing playlists) over the given background. dim fades the background first.
+func (m model) renderPlaylistPicker(background string, dim bool) string {
+	if !m.playlistPicker || m.width < 8 || m.height < 6 {
+		return background
+	}
+	theme := m.settingsManager.GetTheme()
+
+	boxWidth := clamp(m.width/2, 40, 70)
+	if boxWidth > m.width-4 {
+		boxWidth = m.width - 4
+	}
+	innerWidth := boxWidth - 4
+
+	boxStyle := lipgloss.NewStyle().
+		Width(boxWidth).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(theme.Primary)).
+		Padding(1, 2).
+		Background(lipgloss.Color(theme.Background))
+	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Foreground)).Bold(true)
+	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
+
+	var lines []string
+	// Header: what is being added (+ scope hint when from search).
+	header := "Add: " + m.playlistPickerLabel
+	if m.playlistPickerSource == "search" {
+		if m.playlistPickerScope == "all" {
+			header = fmt.Sprintf("Add: all %d shown", len(m.playlistPickerSongs))
+		}
+		header += "   (Tab: " + map[string]string{"selected": "all shown", "all": "selected"}[m.playlistPickerScope] + ")"
+	}
+	lines = append(lines, titleStyle.Render(ansi.Truncate(header, innerWidth, "…")), "")
+
+	if m.textInputActive {
+		// Naming a new playlist.
+		lines = append(lines, mutedStyle.Render("New playlist:"))
+		field := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(theme.Foreground)).
+			Background(lipgloss.Color(theme.Muted)).
+			Padding(0, 1).Width(innerWidth).
+			Render(m.textInputBuffer + "█")
+		lines = append(lines, field, "", mutedStyle.Italic(true).Render("enter create • esc cancel"))
+	} else {
+		names := m.playlistManager.Names()
+		rows := append([]string{"＋ New playlist…"}, names...)
+		// Scroll window keeping the selection visible.
+		const visible = 8
+		start := 0
+		if m.playlistPickerIndex >= visible {
+			start = m.playlistPickerIndex - visible + 1
+		}
+		end := min(start+visible, len(rows))
+		for i := start; i < end; i++ {
+			label := rows[i]
+			if i > 0 {
+				label += "  ·  " + playlistCountLabel(len(m.playlistManager.SongsOf(names[i-1])))
+			}
+			label = ansi.Truncate(label, innerWidth-2, "…")
+			selected := i == m.playlistPickerIndex
+			prefix := "  "
+			if selected {
+				prefix = "> "
+			}
+			lines = append(lines, createGradientStyle(selected, innerWidth, theme).Render(prefix+label))
+		}
+		lines = append(lines, "", mutedStyle.Italic(true).Render(ansi.Truncate("↑↓ pick • enter add • tab scope • esc cancel", innerWidth, "…")))
+	}
+
+	box := boxStyle.Render(strings.Join(lines, "\n"))
+	return m.compositeCentered(background, box, dim)
+}
+
+// renderTextPrompt draws the standalone new/rename playlist name prompt (used
+// from the Library, where no picker is open) over the dimmed app.
+func (m model) renderTextPrompt(background string) string {
+	if !m.textInputActive || m.width < 8 || m.height < 6 {
+		return background
+	}
+	theme := m.settingsManager.GetTheme()
+	boxWidth := clamp(m.width/2, 36, 60)
+	if boxWidth > m.width-4 {
+		boxWidth = m.width - 4
+	}
+	innerWidth := boxWidth - 4
+
+	title := "New playlist"
+	if m.textInputPurpose == "rename-playlist" {
+		title = "Rename playlist"
+	}
+	boxStyle := lipgloss.NewStyle().
+		Width(boxWidth).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(theme.Primary)).
+		Padding(1, 2).
+		Background(lipgloss.Color(theme.Background))
+	field := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.Foreground)).
+		Background(lipgloss.Color(theme.Muted)).
+		Padding(0, 1).Width(innerWidth).
+		Render(m.textInputBuffer + "█")
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted)).Italic(true).
+		Render("enter confirm • esc cancel")
+	box := boxStyle.Render(strings.Join([]string{
+		lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Foreground)).Bold(true).Render(title),
+		"", field, "", help,
+	}, "\n"))
+	return m.compositeCentered(background, box, true)
 }
 
 // renderSearchTabs builds the category strip, showing as many tabs as fit in
@@ -2281,7 +2547,12 @@ func (m *model) isTrackFinished() bool {
 func (m *model) createPlaylistFromContext(selectedSong *Song) []Song {
 	// Get current context from library browser
 	breadcrumb := m.libraryBrowser.GetBreadcrumb()
-	
+
+	// Inside a playlist, the queue is that playlist's songs.
+	if m.libraryBrowser.GetCategoryType() == "playlists" && len(breadcrumb) >= 1 {
+		return m.playlistManager.SongsOf(breadcrumb[0])
+	}
+
 	if len(breadcrumb) == 0 {
 		// Top level - return all songs in current category
 		return m.getCurrentCategorySongs()
@@ -2563,21 +2834,171 @@ func (m *model) playSelectedSearchResult() bool {
 // playAllSearchResults queues every song across all current results (deduped by
 // file path, in listed order) and starts playing — the "play all shown" action.
 func (m *model) playAllSearchResults() bool {
-	seen := make(map[string]bool)
-	var queue []Song
-	for _, r := range m.searchResults {
-		for _, s := range r.songs {
-			if !seen[s.FilePath] {
-				seen[s.FilePath] = true
-				queue = append(queue, s)
-			}
-		}
-	}
+	queue := m.shownSongs()
 	if len(queue) == 0 {
 		return false
 	}
 	m.setPlaylist(queue, 0)
 	return m.playCurrentTrack()
+}
+
+// shownSongs is the deduped union (by FilePath, in listed order) of every song
+// across the current search results.
+func (m *model) shownSongs() []Song {
+	seen := make(map[string]bool)
+	var out []Song
+	for _, r := range m.searchResults {
+		for _, s := range r.songs {
+			if !seen[s.FilePath] {
+				seen[s.FilePath] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// songsToAdd returns the tracks the search-sourced picker will add, honouring
+// the selected/all scope toggle.
+func (m *model) songsToAdd() []Song {
+	if m.playlistPickerScope == "all" {
+		return m.shownSongs()
+	}
+	if m.searchSelected < len(m.searchResults) {
+		return m.searchResults[m.searchSelected].songs
+	}
+	return nil
+}
+
+// openPlaylistPicker captures what to add based on context (search result,
+// selected library item, or the currently-playing track) and opens the picker.
+func (m *model) openPlaylistPicker() bool {
+	var songs []Song
+	var label, source string
+	switch {
+	case m.searchMode:
+		if len(m.searchResults) == 0 {
+			return false
+		}
+		source = "search"
+		m.playlistPickerScope = "selected"
+		songs = m.songsToAdd()
+		label = m.searchResults[m.searchSelected].title
+	case m.currentView == "library" && !m.nowPlayingFocused && len(m.libraryBrowser.SongsForSelected()) > 0:
+		source = "library"
+		songs = m.libraryBrowser.SongsForSelected()
+		label = m.libraryBrowser.SelectedLabel()
+	case m.playingSong != nil:
+		source = "nowplaying"
+		songs = []Song{*m.playingSong}
+		label = m.playingSong.Title
+	default:
+		return false
+	}
+
+	m.playlistPickerSongs = songs
+	m.playlistPickerLabel = label
+	m.playlistPickerSource = source
+	m.playlistPicker = true
+	m.playlistPickerIndex = 0
+	return true
+}
+
+// handlePlaylistPickerKey drives the modal add-to-playlist picker.
+func (m model) handlePlaylistPickerKey(keyStr string) (tea.Model, tea.Cmd) {
+	names := m.playlistManager.Names()
+	total := len(names) + 1 // +1 for "＋ New playlist…"
+	switch keyStr {
+	case "esc":
+		m.playlistPicker = false
+	case "up":
+		if m.playlistPickerIndex > 0 {
+			m.playlistPickerIndex--
+		}
+	case "down":
+		if m.playlistPickerIndex < total-1 {
+			m.playlistPickerIndex++
+		}
+	case "tab":
+		if m.playlistPickerSource == "search" {
+			if m.playlistPickerScope == "all" {
+				m.playlistPickerScope = "selected"
+			} else {
+				m.playlistPickerScope = "all"
+			}
+			m.playlistPickerSongs = m.songsToAdd()
+		}
+	case "enter":
+		if m.playlistPickerIndex == 0 {
+			m.startTextInput("new-playlist-add", "")
+		} else {
+			name := names[m.playlistPickerIndex-1]
+			added, _ := m.playlistManager.AddSongs(name, m.playlistPickerSongs)
+			m.statusFlash = fmt.Sprintf("Added %d to \"%s\"", added, name)
+			m.playlistPicker = false
+			m.refreshPlaylistListIfShown()
+		}
+	}
+	return m, nil
+}
+
+// refreshPlaylistListIfShown rebuilds the library's playlist list, but only when
+// that top-level list is actually on screen — so a mutation triggered elsewhere
+// (search picker, now-playing) never disturbs an in-progress library drill-down.
+func (m *model) refreshPlaylistListIfShown() {
+	if m.libraryBrowser.GetCategoryType() == "playlists" && len(m.libraryBrowser.GetBreadcrumb()) == 0 {
+		m.libraryBrowser.refreshContents()
+	}
+}
+
+// selectedLibraryPlaylistName returns the highlighted top-level playlist's name,
+// or "" if the selection isn't a playlist row.
+func (m *model) selectedLibraryPlaylistName() string {
+	contents := m.libraryBrowser.GetContents()
+	idx := m.libraryBrowser.GetContentIndex()
+	if idx < len(contents) && contents[idx].Type == "playlist" {
+		return contents[idx].Title
+	}
+	return ""
+}
+
+func (m *model) startTextInput(purpose, initial string) {
+	m.textInputActive = true
+	m.textInputPurpose = purpose
+	m.textInputBuffer = initial
+}
+
+func (m *model) cancelTextInput() {
+	m.textInputActive = false
+	m.textInputBuffer = ""
+}
+
+// commitTextInput applies a finished playlist name/rename.
+func (m *model) commitTextInput() {
+	name := strings.TrimSpace(m.textInputBuffer)
+	purpose := m.textInputPurpose
+	m.textInputActive = false
+	m.textInputBuffer = ""
+	if name == "" {
+		return
+	}
+	switch purpose {
+	case "new-playlist-add":
+		added, _ := m.playlistManager.AddSongs(name, m.playlistPickerSongs)
+		m.statusFlash = fmt.Sprintf("Added %d to \"%s\"", added, name)
+		m.playlistPicker = false
+		m.refreshPlaylistListIfShown()
+	case "new-playlist-empty":
+		if err := m.playlistManager.Create(name); err == nil {
+			m.statusFlash = fmt.Sprintf("Created \"%s\"", name)
+		}
+		m.refreshPlaylistListIfShown()
+	case "rename-playlist":
+		if err := m.playlistManager.Rename(m.playlistRenameTarget, name); err == nil {
+			m.statusFlash = fmt.Sprintf("Renamed to \"%s\"", name)
+		}
+		m.refreshPlaylistListIfShown()
+	}
 }
 
 // performSearch scores every song against the query (across title/artist/album)
