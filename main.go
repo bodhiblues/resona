@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"sort"
@@ -87,7 +88,8 @@ type model struct {
 	// Search functionality
 	searchMode        bool
 	searchQuery       string
-	searchResults     []Song
+	searchCategory    string // "songs", "artists", "albums", "genres"
+	searchResults     []searchResult
 	searchSelected    int
 	// Main content viewport
 	contentViewport   viewport
@@ -312,23 +314,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.searchMode {
 			switch keyStr {
 			case "esc":
-				m.searchMode = false
-				m.searchQuery = ""
-				m.searchResults = []Song{}
+				m.closeSearch()
+				return m, nil
+			case "tab":
+				m.cycleSearchCategory(1)
+				return m, nil
+			case "shift+tab":
+				m.cycleSearchCategory(-1)
 				return m, nil
 			case "enter":
-				if len(m.searchResults) > 0 && m.searchSelected < len(m.searchResults) {
-					// Create playlist from search results
-					playlist := make([]Song, len(m.searchResults))
-					copy(playlist, m.searchResults)
-					
-					m.setPlaylist(playlist, m.searchSelected)
-					if m.playCurrentTrack() {
-						m.searchMode = false
-						m.searchQuery = ""
-						m.searchResults = []Song{}
-						return m, tickCmd()
-					}
+				if m.playSelectedSearchResult() {
+					m.closeSearch()
+					return m, tickCmd()
+				}
+				return m, nil
+			case "ctrl+a":
+				// Play everything currently listed (e.g. all jazz sub-genres).
+				if m.playAllSearchResults() {
+					m.closeSearch()
+					return m, tickCmd()
 				}
 				return m, nil
 			case "up":
@@ -347,6 +351,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.performSearch(m.searchQuery)
 				}
 				return m, nil
+			case "space", " ":
+				// Space arrives as the named key "space", not a printable rune.
+				m.searchQuery += " "
+				m.performSearch(m.searchQuery)
+				return m, nil
 			default:
 				// Add character to search query
 				if len(keyStr) == 1 && keyStr[0] >= 32 && keyStr[0] <= 126 {
@@ -358,11 +367,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		
 		switch keyStr {
-		case "/":
-			// Enter search mode
+		case "/", "ctrl+k":
+			// Enter search mode (Spotlight-style, works from any tab)
 			m.searchMode = true
 			m.searchQuery = ""
-			m.searchResults = []Song{}
+			m.searchCategory = "songs"
+			m.searchResults = nil
 			m.searchSelected = 0
 			return m, nil
 		case "space", " ":
@@ -867,17 +877,17 @@ func (m model) renderView() string {
 		bottomSection,
 	)
 	
-	// Overlay search if active
-	view := mainView
-	if m.searchMode {
-		view = m.renderSearch()
-	}
+	// Hard-clip every line to the terminal width so that any long content
+	// (status help text, radio rows, deep paths, …) can't wrap onto a second
+	// visual row and break the layout. The per-component truncation above keeps
+	// things tidy with ellipses; this just guarantees correctness.
+	mainView = lipgloss.NewStyle().MaxWidth(m.width).Render(mainView)
 
-	// Final safety net: hard-clip every line to the terminal width so that any
-	// long content (status help text, radio rows, deep paths, …) can't wrap onto
-	// a second visual row and break the layout. The per-component truncation
-	// above keeps things tidy with ellipses; this just guarantees correctness.
-	return lipgloss.NewStyle().MaxWidth(m.width).Render(view)
+	// Overlay search if active: float the modal over a dimmed copy of the app.
+	if m.searchMode {
+		return m.renderSearch(mainView)
+	}
+	return mainView
 }
 
 func (m model) renderTabs() string {
@@ -1976,115 +1986,223 @@ func (m model) renderFolderBrowser() string {
 	return lipgloss.NewStyle().MaxWidth(m.width).Render(lipgloss.JoinVertical(lipgloss.Left, items...))
 }
 
-func (m model) renderSearch() string {
-	if !m.searchMode {
-		return ""
+// renderSearch draws the search modal floating over a dimmed copy of the app
+// (passed as background). The box scales with the terminal — biased toward
+// width, since most screens are wider than tall — so long titles aren't clipped
+// on big windows.
+func (m model) renderSearch(background string) string {
+	if !m.searchMode || m.width < 8 || m.height < 6 {
+		return background
 	}
-	
-	// Calculate center position
-	searchBoxWidth := 60
-	searchBoxHeight := 12
-	if m.width < searchBoxWidth + 4 {
+
+	theme := m.settingsManager.GetTheme()
+
+	// Responsive box size: ~2/3 width, ~3/5 height, clamped to sane bounds.
+	searchBoxWidth := clamp(m.width*2/3, 48, 120)
+	if searchBoxWidth > m.width-4 {
 		searchBoxWidth = m.width - 4
 	}
-	
-	// Get theme for search styles
-	theme := m.settingsManager.GetTheme()
-	
-	// Create search box style
+	searchBoxHeight := clamp(m.height*3/5, 14, 28)
+	if searchBoxHeight > m.height-2 {
+		searchBoxHeight = m.height - 2
+	}
+
+	// Inner content area (Height/Width exclude the border, include padding).
+	contentHeight := searchBoxHeight - 2 // top+bottom padding
+	innerWidth := searchBoxWidth - 4     // left+right padding (2 each)
+
 	searchBoxStyle := lipgloss.NewStyle().
 		Width(searchBoxWidth).
 		Height(searchBoxHeight).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(theme.Primary)).
-		Padding(1).
+		Padding(1, 2).
 		Background(lipgloss.Color(theme.Background))
-	
+
 	// Search input line
 	queryStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(theme.Foreground)).
 		Background(lipgloss.Color(theme.Muted)).
 		Padding(0, 1).
-		Width(searchBoxWidth - 4)
-	
-	searchPrompt := "🔍 Search: " + m.searchQuery + "█"
-	queryLine := queryStyle.Render(searchPrompt)
-	
-	// Results
+		Width(innerWidth)
+	queryLine := queryStyle.Render("🔍 Search: " + m.searchQuery + "█")
+
+	tabStrip := m.renderSearchTabs(innerWidth, theme)
+
+	kindIcons := map[string]string{"song": "♪", "artist": "♫", "album": "▤", "genre": "♦"}
+
+	// Header: query, blank, tabs, blank (4 lines). Footer: help (1 line).
+	// The rest of the content area is available for result rows.
 	var resultLines []string
-	resultLines = append(resultLines, queryLine)
-	resultLines = append(resultLines, "")
-	
+	resultLines = append(resultLines, queryLine, "", tabStrip, "")
+	visible := contentHeight - len(resultLines) - 1 // reserve 1 line for help
+	if visible < 3 {
+		visible = 3
+	}
+
+	maxLineWidth := innerWidth - 2
 	if len(m.searchResults) == 0 {
-		theme := m.settingsManager.GetTheme()
 		mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted))
 		if len(m.searchQuery) == 0 {
-			resultLines = append(resultLines, mutedStyle.Render("Type to search for songs..."))
+			resultLines = append(resultLines, mutedStyle.Render("Type to search "+m.searchCategory+"…"))
 		} else {
 			resultLines = append(resultLines, mutedStyle.Render("No results found"))
 		}
 	} else {
-		maxResults := min(8, len(m.searchResults))
-		for i := 0; i < maxResults; i++ {
-			song := m.searchResults[i]
+		// Scroll a window of rows so the selection stays visible.
+		start := 0
+		if m.searchSelected >= visible {
+			start = m.searchSelected - visible + 1
+		}
+		end := min(start+visible, len(m.searchResults))
+		for i := start; i < end; i++ {
+			r := m.searchResults[i]
 			isSelected := i == m.searchSelected
-			var prefix string
-			
+			prefix := "  "
 			if isSelected {
 				prefix = "> "
-			} else {
-				prefix = "  "
 			}
-			
-			songText := prefix + "♪ " + song.Title
-			if song.Artist != "Unknown Artist" {
-				songText += " - " + song.Artist
+
+			rowText := prefix + kindIcons[r.kind] + " " + r.title
+			if r.subtitle != "" {
+				rowText += "  ·  " + r.subtitle
 			}
-			
-			// Truncate if too long
-			maxLineWidth := searchBoxWidth - 6
-			if len(songText) > maxLineWidth {
-				songText = songText[:maxLineWidth-3] + "..."
-			}
-			
-			// Create gradient style for selection
-			theme := m.settingsManager.GetTheme()
-			style := createGradientStyle(isSelected, searchBoxWidth-4, theme)
-			resultLines = append(resultLines, style.Render(songText))
+			rowText = ansi.Truncate(rowText, maxLineWidth, "…")
+
+			style := createGradientStyle(isSelected, innerWidth, theme)
+			resultLines = append(resultLines, style.Render(rowText))
 		}
 	}
-	
-	// Fill remaining lines
-	for len(resultLines) < searchBoxHeight - 2 {
+
+	// Fill so the help text sits on the last content line.
+	for len(resultLines) < contentHeight-1 {
 		resultLines = append(resultLines, "")
 	}
-	
-	// Add help text
-	helpStyle := lipgloss.NewStyle().
+	helpStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted)).Italic(true)
+	help := "↑↓ move • tab switch • enter play • ^A play all • esc close"
+	resultLines = append(resultLines, helpStyle.Render(ansi.Truncate(help, innerWidth, "…")))
+
+	box := searchBoxStyle.Render(strings.Join(resultLines, "\n"))
+
+	// Composite the modal over a dimmed copy of the app using lipgloss layers.
+	boxW, boxH := lipgloss.Width(box), lipgloss.Height(box)
+	x := (m.width - boxW) / 2
+	y := (m.height - boxH) / 2
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+
+	canvas := lipgloss.NewCanvas(m.width, m.height)
+	canvas.Compose(lipgloss.NewLayer(background)) // paint the app across the canvas
+	m.dimCanvas(canvas)                           // fade it toward the background
+	// A bare Layer's X/Y offset is only applied by a Compositor (Layer.Draw
+	// itself ignores it), so wrap the modal in one to place it at (x, y).
+	canvas.Compose(lipgloss.NewCompositor(lipgloss.NewLayer(box).X(x).Y(y)))
+	return canvas.Render()
+}
+
+// renderSearchTabs builds the category strip, showing as many tabs as fit in
+// width. When they overflow (many categories on a narrow box) it windows around
+// the active tab and marks hidden ones with ‹ / ›.
+func (m model) renderSearchTabs(width int, theme Theme) string {
+	active := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.Background)).
+		Background(lipgloss.Color(theme.Primary)).
+		Bold(true).
+		Padding(0, 1)
+	inactive := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(theme.Muted)).
-		Italic(true)
-	resultLines = append(resultLines, helpStyle.Render("↑/↓ navigate • enter to play • esc to close"))
-	
-	content := strings.Join(resultLines, "\n")
-	searchBox := searchBoxStyle.Render(content)
-	
-	// Center the search box
-	leftPadding := (m.width - searchBoxWidth) / 2
-	topPadding := (m.height - searchBoxHeight) / 2
-	
-	// Create padding
-	var lines []string
-	for i := 0; i < topPadding; i++ {
-		lines = append(lines, "")
+		Padding(0, 1)
+
+	segs := make([]string, len(searchCategories))
+	activeIdx := 0
+	for i, c := range searchCategories {
+		if c == m.searchCategory {
+			segs[i] = active.Render(searchCategoryLabels[c])
+			activeIdx = i
+		} else {
+			segs[i] = inactive.Render(searchCategoryLabels[c])
+		}
 	}
-	
-	searchBoxLines := strings.Split(searchBox, "\n")
-	for _, line := range searchBoxLines {
-		paddedLine := strings.Repeat(" ", leftPadding) + line
-		lines = append(lines, paddedLine)
+
+	if ansi.StringWidth(strings.Join(segs, "")) <= width {
+		return strings.Join(segs, "")
 	}
-	
-	return strings.Join(lines, "\n")
+
+	// Grow a window outward from the active tab while it fits (reserve 2 cells
+	// for the ‹ › overflow markers).
+	lo, hi := activeIdx, activeIdx
+	used := ansi.StringWidth(segs[activeIdx])
+	for {
+		grew := false
+		if hi+1 < len(segs) && used+ansi.StringWidth(segs[hi+1]) <= width-2 {
+			hi++
+			used += ansi.StringWidth(segs[hi])
+			grew = true
+		}
+		if lo-1 >= 0 && used+ansi.StringWidth(segs[lo-1]) <= width-2 {
+			lo--
+			used += ansi.StringWidth(segs[lo])
+			grew = true
+		}
+		if !grew {
+			break
+		}
+	}
+	strip := strings.Join(segs[lo:hi+1], "")
+	if lo > 0 {
+		strip = "‹" + strip
+	}
+	if hi < len(segs)-1 {
+		strip += "›"
+	}
+	return strip
+}
+
+// dimCanvas fades every already-painted cell toward the theme background so the
+// app reads as a lowered-opacity backdrop behind the modal.
+func (m model) dimCanvas(c *lipgloss.Canvas) {
+	bg := hexToRGB(m.settingsManager.GetTheme().Background)
+	for y := 0; y < c.Height(); y++ {
+		for x := 0; x < c.Width(); x++ {
+			cell := c.CellAt(x, y)
+			if cell == nil {
+				continue
+			}
+			cell.Style.Fg = dimColor(cell.Style.Fg, bg, 0.45)
+			cell.Style.Bg = dimColor(cell.Style.Bg, bg, 0.30)
+		}
+	}
+}
+
+// dimColor blends c toward bg, keeping `keep` fraction of the original. A nil
+// (default) color is left untouched.
+func dimColor(c color.Color, bg RGB, keep float64) color.Color {
+	if c == nil {
+		return nil
+	}
+	r, g, b, a := c.RGBA()
+	if a == 0 {
+		return c
+	}
+	nr := float64(r>>8)*keep + bg.R*(1-keep)
+	ng := float64(g>>8)*keep + bg.G*(1-keep)
+	nb := float64(b>>8)*keep + bg.B*(1-keep)
+	return color.RGBA{uint8(nr), uint8(ng), uint8(nb), 0xff}
+}
+
+// clamp constrains v to [lo, hi].
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func min(a, b int) int {
@@ -2324,107 +2442,413 @@ func (m *model) findSongInPlaylist(playlist []Song, targetSong *Song) int {
 }
 
 // Fuzzy search functionality
-type searchMatch struct {
-	song  Song
-	score int
+
+// searchResult is one row in the Spotlight-style search overlay. Depending on
+// the active category it represents a single song or a whole artist/album/genre
+// group; songs holds the tracks queued when the row is chosen.
+type searchResult struct {
+	kind     string // "song", "artist", "album", "genre"
+	title    string // primary display text
+	subtitle string // secondary line (artist, counts, …)
+	song     *Song  // set when kind == "song"
+	songs    []Song // tracks queued when this row is selected
+	score    int
 }
 
-func (m *model) performSearch(query string) {
-	if len(query) == 0 {
-		m.searchResults = []Song{}
-		return
-	}
-	
-	allSongs := m.libraryManager.GetSongs()
-	var matches []searchMatch
-	
-	queryLower := strings.ToLower(query)
-	
-	for _, song := range allSongs {
-		score := calculateMatchScore(song, queryLower)
-		if score > 0 {
-			matches = append(matches, searchMatch{song: song, score: score})
+// searchCategories is the Tab-cycle order for the search overlay. The last two
+// match the query against a song's genre: "genre-songs" lists matching songs,
+// "genre-albums" lists albums whose genre matches.
+var searchCategories = []string{"songs", "artists", "albums", "genres", "genre-songs", "genre-albums"}
+
+// searchCategoryLabels are the display names for the tab strip.
+var searchCategoryLabels = map[string]string{
+	"songs":        "Songs",
+	"artists":      "Artists",
+	"albums":       "Albums",
+	"genres":       "Genres",
+	"genre-songs":  "Genre songs",
+	"genre-albums": "Genre albums",
+}
+
+// groupKey returns the bucket key for a song under the given grouping ("artist",
+// "album", "genre"). The album key mirrors LibraryBrowser.getAlbums
+// ("Album - Artist"), and empty tags fall back to the same "Unknown …" labels
+// the library browser shows.
+func groupKey(s Song, kind string) string {
+	switch kind {
+	case "artist":
+		if s.Artist == "" {
+			return "Unknown Artist"
 		}
-	}
-	
-	// Sort by score (higher is better)
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].score > matches[j].score
-	})
-	
-	// Extract top 20 results
-	m.searchResults = []Song{}
-	maxResults := 20
-	for i, match := range matches {
-		if i >= maxResults {
-			break
+		return s.Artist
+	case "album":
+		album := s.Album
+		if album == "" {
+			album = "Unknown Album"
 		}
-		m.searchResults = append(m.searchResults, match.song)
+		return album + " - " + s.Artist
+	case "genre":
+		if s.Genre == "" {
+			return "Unknown Genre"
+		}
+		return s.Genre
 	}
-	
+	return ""
+}
+
+// groupLabel is the display title (and fuzzy-match target) for a group key: the
+// bare album title for albums, the key itself for artists/genres.
+func groupLabel(kind, key string) string {
+	if kind == "album" {
+		album, _ := splitAlbumKey(key)
+		return album
+	}
+	return key
+}
+
+func (m *model) closeSearch() {
+	m.searchMode = false
+	m.searchQuery = ""
+	m.searchResults = nil
 	m.searchSelected = 0
 }
 
-func calculateMatchScore(song Song, query string) int {
-	title := strings.ToLower(song.Title)
-	artist := strings.ToLower(song.Artist)
-	album := strings.ToLower(song.Album)
-	
-	score := 0
-	
-	// Exact matches get highest score
-	if strings.Contains(title, query) {
-		score += 100
+// cycleSearchCategory moves the active category forward (dir=1) or backward
+// (dir=-1) through searchCategories and re-runs the query.
+func (m *model) cycleSearchCategory(dir int) {
+	idx := 0
+	for i, c := range searchCategories {
+		if c == m.searchCategory {
+			idx = i
+			break
+		}
 	}
-	if strings.Contains(artist, query) {
-		score += 80
+	idx = (idx + dir + len(searchCategories)) % len(searchCategories)
+	m.searchCategory = searchCategories[idx]
+	m.performSearch(m.searchQuery)
+}
+
+// playSelectedSearchResult builds a queue from the highlighted row and starts
+// playback. A song row queues the visible songs (starting at the selection); an
+// artist/album/genre row queues that whole group. Returns false if nothing plays.
+func (m *model) playSelectedSearchResult() bool {
+	if m.searchSelected < 0 || m.searchSelected >= len(m.searchResults) {
+		return false
 	}
-	if strings.Contains(album, query) {
-		score += 60
+	sel := m.searchResults[m.searchSelected]
+
+	var queue []Song
+	start := 0
+	if sel.kind == "song" {
+		for i, r := range m.searchResults {
+			if r.kind != "song" || r.song == nil {
+				continue
+			}
+			if i == m.searchSelected {
+				start = len(queue)
+			}
+			queue = append(queue, *r.song)
+		}
+	} else {
+		queue = append(queue, sel.songs...)
 	}
-	
-	// Fuzzy matching - check if all characters of query appear in order
-	if fuzzyMatch(title, query) {
-		score += 50
+
+	if len(queue) == 0 {
+		return false
 	}
-	if fuzzyMatch(artist, query) {
-		score += 40
+	m.setPlaylist(queue, start)
+	return m.playCurrentTrack()
+}
+
+// playAllSearchResults queues every song across all current results (deduped by
+// file path, in listed order) and starts playing — the "play all shown" action.
+func (m *model) playAllSearchResults() bool {
+	seen := make(map[string]bool)
+	var queue []Song
+	for _, r := range m.searchResults {
+		for _, s := range r.songs {
+			if !seen[s.FilePath] {
+				seen[s.FilePath] = true
+				queue = append(queue, s)
+			}
+		}
 	}
-	if fuzzyMatch(album, query) {
-		score += 30
+	if len(queue) == 0 {
+		return false
 	}
-	
-	// Prefix matching gets bonus points
-	if strings.HasPrefix(title, query) {
-		score += 200
+	m.setPlaylist(queue, 0)
+	return m.playCurrentTrack()
+}
+
+// performSearch scores every song against the query (across title/artist/album)
+// and then presents the hits in the active category. In a grouped category the
+// query filters songs and we group the survivors by that dimension — so typing
+// an artist name and Tab-ing to Albums lists that artist's albums, not albums
+// whose title happens to match. A group also appears if its own label matches
+// (e.g. "jazz" in Genres), in which case the whole group is queued.
+func (m *model) performSearch(query string) {
+	m.searchSelected = 0
+	m.searchResults = nil
+	if len(query) == 0 {
+		return
 	}
-	if strings.HasPrefix(artist, query) {
-		score += 150
+
+	q := strings.ToLower(query)
+	allSongs := m.libraryManager.GetSongs()
+
+	// The genre-scoped categories match a song's genre; the rest match
+	// title/artist/album. Score each song once with the right target.
+	byGenre := m.searchCategory == "genre-songs" || m.searchCategory == "genre-albums"
+	scores := make([]int, len(allSongs))
+	for i := range allSongs {
+		if byGenre {
+			scores[i] = fuzzyScore(allSongs[i].Genre, q)
+		} else {
+			scores[i] = scoreSong(allSongs[i], q)
+		}
 	}
-	
+
+	// Flat categories that produce one row per matching song.
+	if m.searchCategory == "songs" || m.searchCategory == "genre-songs" {
+		var results []searchResult
+		for i := range allSongs {
+			if scores[i] > 0 {
+				s := allSongs[i]
+				subtitle := songSubtitle(s)
+				if byGenre {
+					subtitle = s.Artist + " • " + s.Genre
+				}
+				results = append(results, searchResult{
+					kind:     "song",
+					title:    s.Title,
+					subtitle: subtitle,
+					song:     &s,
+					songs:    []Song{s},
+					score:    scores[i],
+				})
+			}
+		}
+		m.searchResults = sortTrim(results)
+		return
+	}
+
+	// Grouped categories: bucket every song, tracking which ones matched.
+	// "genre-albums" groups by album but was matched on genre above.
+	kind := "album"
+	switch m.searchCategory {
+	case "artists":
+		kind = "artist"
+	case "genres":
+		kind = "genre"
+	}
+	type bucket struct {
+		all, matched []Song
+		best         int
+	}
+	buckets := make(map[string]*bucket)
+	for i := range allSongs {
+		key := groupKey(allSongs[i], kind)
+		b := buckets[key]
+		if b == nil {
+			b = &bucket{}
+			buckets[key] = b
+		}
+		b.all = append(b.all, allSongs[i])
+		if scores[i] > b.best {
+			b.best = scores[i]
+		}
+		if scores[i] > 0 {
+			b.matched = append(b.matched, allSongs[i])
+		}
+	}
+
+	var results []searchResult
+	for key, b := range buckets {
+		score := b.best
+		// A group can also surface if its own label matches (e.g. "jazz" in
+		// Genres). Genre-albums are matched purely on the genre field above.
+		if !byGenre {
+			if ls := fuzzyScore(groupLabel(kind, key), q); ls > score {
+				score = ls
+			}
+		}
+		if score <= 0 {
+			continue
+		}
+
+		// Queue the matching songs; if only the label matched, queue everything.
+		songs := b.matched
+		if len(songs) == 0 {
+			songs = b.all
+		}
+
+		r := searchResult{kind: kind, title: groupLabel(kind, key), songs: songs, score: score}
+		switch kind {
+		case "artist":
+			r.subtitle = groupSubtitle(songs, "artist")
+		case "album":
+			sortByTrack(songs)
+			_, artist := splitAlbumKey(key)
+			r.subtitle = artist + " • " + strconv.Itoa(len(songs)) + " songs"
+			if m.searchCategory == "genre-albums" && len(songs) > 0 {
+				r.subtitle = artist + " • " + songs[0].Genre + " • " + strconv.Itoa(len(songs)) + " songs"
+			}
+		case "genre":
+			r.subtitle = groupSubtitle(songs, "genre")
+		}
+		results = append(results, r)
+	}
+	m.searchResults = sortTrim(results)
+}
+
+// sortTrim orders results by score (title as a stable tie-break) and caps the list.
+func sortTrim(results []searchResult) []searchResult {
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].score != results[j].score {
+			return results[i].score > results[j].score
+		}
+		return results[i].title < results[j].title
+	})
+	if len(results) > 50 {
+		results = results[:50]
+	}
+	return results
+}
+
+// scoreSong ranks a song against the query across its fields, weighting the
+// title above the artist above the album. Returns 0 when nothing matches.
+func scoreSong(s Song, query string) int {
+	best := 0
+	if v := fuzzyScore(s.Title, query); v > 0 {
+		best = max(best, v+50)
+	}
+	if v := fuzzyScore(s.Artist, query); v > 0 {
+		best = max(best, v+20)
+	}
+	if v := fuzzyScore(s.Album, query); v > 0 {
+		best = max(best, v)
+	}
+	return best
+}
+
+// fuzzyScore ranks how well query (already lowercased by the caller) matches
+// text. It returns 0 when query is not a subsequence of text. Higher is better:
+// exact and prefix matches dominate, then contiguous substrings, then
+// word-boundary starts, then loose subsequence matches with an adjacency bonus.
+func fuzzyScore(text, query string) int {
+	if query == "" {
+		return 0
+	}
+	lt := strings.ToLower(text)
+
+	if lt == query {
+		return 1000
+	}
+	if strings.HasPrefix(lt, query) {
+		return 800 + lengthBonus(lt)
+	}
+	if idx := strings.Index(lt, query); idx >= 0 {
+		score := 500
+		if isBoundary(lt, idx) {
+			score += 100
+		}
+		return score + lengthBonus(lt)
+	}
+
+	// Loose subsequence match with adjacency / word-boundary bonuses.
+	ti, qi, score := 0, 0, 0
+	prevMatched := false
+	for ti < len(lt) && qi < len(query) {
+		if lt[ti] == query[qi] {
+			score++
+			if prevMatched {
+				score += 5
+			}
+			if isBoundary(lt, ti) {
+				score += 3
+			}
+			qi++
+			prevMatched = true
+		} else {
+			prevMatched = false
+		}
+		ti++
+	}
+	if qi < len(query) {
+		return 0 // not all query characters matched
+	}
 	return score
 }
 
-func fuzzyMatch(text, pattern string) bool {
-	textLen := len(text)
-	patternLen := len(pattern)
-	
-	if patternLen == 0 {
-		return true
+// isBoundary reports whether position i in text begins a word.
+func isBoundary(text string, i int) bool {
+	return i == 0 || text[i-1] == ' ' || text[i-1] == '-' || text[i-1] == '_'
+}
+
+// lengthBonus favours shorter (usually more relevant) matches.
+func lengthBonus(text string) int {
+	if len(text) >= 40 {
+		return 0
 	}
-	if textLen == 0 {
-		return false
-	}
-	
-	i, j := 0, 0
-	for i < textLen && j < patternLen {
-		if text[i] == pattern[j] {
-			j++
+	return 40 - len(text)
+}
+
+func songSubtitle(s Song) string {
+	subtitle := s.Artist
+	if s.Album != "" && s.Album != "Unknown Album" {
+		if subtitle != "" {
+			subtitle += " • "
 		}
-		i++
+		subtitle += s.Album
 	}
-	
-	return j == patternLen
+	return subtitle
+}
+
+// groupSubtitle builds the "N albums, M songs" / "N artists, M songs" count line
+// for an artist or genre group, matching LibraryBrowser's wording.
+func groupSubtitle(songs []Song, kind string) string {
+	seen := make(map[string]bool)
+	var noun string
+	for _, s := range songs {
+		if kind == "artist" {
+			key := s.Album
+			if key == "" {
+				key = "Unknown Album"
+			}
+			seen[key] = true
+			noun = "album"
+		} else { // genre → count artists
+			key := s.Artist
+			if key == "" {
+				key = "Unknown Artist"
+			}
+			seen[key] = true
+			noun = "artist"
+		}
+	}
+	word := noun + "s"
+	if len(seen) == 1 {
+		word = noun
+	}
+	return fmt.Sprintf("%d %s, %d songs", len(seen), word, len(songs))
+}
+
+func splitAlbumKey(key string) (album, artist string) {
+	parts := strings.SplitN(key, " - ", 2)
+	album = parts[0]
+	if len(parts) > 1 {
+		artist = parts[1]
+	}
+	if artist == "" {
+		artist = "Unknown Artist"
+	}
+	return album, artist
+}
+
+func sortByTrack(songs []Song) {
+	sort.SliceStable(songs, func(i, j int) bool {
+		return songs[i].TrackNumber < songs[j].TrackNumber
+	})
 }
 
 func (m model) renderRadio() string {
