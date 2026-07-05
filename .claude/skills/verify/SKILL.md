@@ -29,7 +29,25 @@ Clean up: `tmux -L resona-verify kill-server; rm resona-test`.
   plays it without saving (needs network, emits audio).
 - Status line (last pane row) shows `▶ Playing / ⏸ Paused / ⏹ Stopped`.
 
+## Mouse events
+
+The app has mouse support; synthesize clicks with raw SGR sequences, e.g.
+click col 134 / row 39 (1-based): `tmux -L resona-verify send-keys -t 0 -H
+1b 5b 3c 30 3b 31 33 34 3b 33 39 4d` (press, `...6d` = release). Useful for
+seeking on the progress bar.
+
 ## Gotchas
+
+- After verification passes, ALWAYS rebuild the real binary the user
+  launches (`go build -o resona .`) — verifying a throwaway build and
+  leaving `./resona` stale caused a false "still broken" report once.
+- In the radio tab, `s` means *save & play* in the add/quickadd views and
+  *stop* everywhere else — stopping playback while a radio form is open
+  saves a junk station to `~/.resona/radio_stations.json`. Stop from the
+  library/files tab instead. The quickadd form only appears when the saved
+  station list is empty.
+- `/` is a global search hotkey — you can't type a URL containing `/` into
+  a radio form field unless input mode is active (Enter first).
 
 - `pgrep -x resona-test` for the app PID — plain pgrep matches the tmux
   server too. Sample CPU: `top -b -n 3 -d 2 -p $PID`.

@@ -615,7 +615,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			m.audioPlayer.Stop()
 			return m, tea.Quit
-		case "s":
+		case "ctrl+s":
+			// Saving in the radio forms lives on ctrl+s so that plain 's'
+			// can stay the global stop key — with save on 's', stopping
+			// playback while a radio form was open silently saved a station.
 			if m.currentView == "radio" && m.radioBrowser.GetCurrentView() == "add" {
 				if err := m.radioBrowser.SaveStation(); err == nil {
 					// Station saved successfully
@@ -628,16 +631,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, m.startRadioStation(&stations[len(stations)-1])
 					}
 				}
-			} else {
-				m.audioPlayer.CancelPendingPlays()
-				m.audioPlayer.Stop()
-				m.playing = ""
-				m.playingSong = nil
-				m.playingStation = nil
-				m.radioStartTime = time.Time{}
-				m.radioElapsed = 0
-				m.nowPlayingFocused = false
 			}
+			return m, nil
+		case "s":
+			m.audioPlayer.CancelPendingPlays()
+			m.audioPlayer.Stop()
+			m.playing = ""
+			m.playingSong = nil
+			m.playingStation = nil
+			m.radioStartTime = time.Time{}
+			m.radioElapsed = 0
+			m.nowPlayingFocused = false
 			return m, nil
 		case "p":
 			if m.currentView == "radio" && m.radioBrowser.GetCurrentView() == "quickadd" {
@@ -1062,13 +1066,13 @@ func (m model) renderView() string {
 			if m.radioBrowser.IsInputMode() {
 				controlsText = "Type to input, enter to save, escape to cancel"
 			} else {
-				controlsText = "↑/↓ navigate fields, enter to edit, 's' to save station, escape to cancel"
+				controlsText = "↑/↓ navigate fields, enter to edit, ^S to save station, escape to cancel"
 			}
 		} else if m.radioBrowser.GetCurrentView() == "quickadd" {
 			if m.radioBrowser.IsInputMode() {
 				controlsText = "Type to input, enter to save, escape to cancel"
 			} else {
-				controlsText = "↑/↓ navigate, enter to edit, 'p' to play now, 's' to save & play, 'a' for full form, escape to cancel"
+				controlsText = "↑/↓ navigate, enter to edit, 'p' to play now, ^S to save & play, 'a' for full form, escape to cancel"
 			}
 		} else {
 			controlsText = "↑/↓ navigate, enter to play station, 'a' to add station, f to switch view, q to quit"
@@ -3514,7 +3518,7 @@ func (m model) renderRadioAddForm() string {
 	if m.radioBrowser.IsInputMode() {
 		items = append(items, labelStyle.Render("Enter to save, Escape to cancel input"))
 	} else {
-		items = append(items, labelStyle.Render("↑/↓ to navigate, Enter to edit field, 's' to save, Escape to cancel"))
+		items = append(items, labelStyle.Render("↑/↓ to navigate, Enter to edit field, ^S to save, Escape to cancel"))
 	}
 	
 	return lipgloss.JoinVertical(lipgloss.Left, items...)
@@ -3602,7 +3606,7 @@ func (m model) renderRadioQuickAdd() string {
 	if m.radioBrowser.IsInputMode() {
 		items = append(items, labelStyle.Render("Enter to save, Escape to cancel input"))
 	} else {
-		items = append(items, labelStyle.Render("↑/↓ navigate, Enter to edit, 'p' to play now, 's' to save & play, 'a' for full form, Escape to cancel"))
+		items = append(items, labelStyle.Render("↑/↓ navigate, Enter to edit, 'p' to play now, ^S to save & play, 'a' for full form, Escape to cancel"))
 	}
 	
 	return lipgloss.JoinVertical(lipgloss.Left, items...)
