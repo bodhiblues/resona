@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopxl/beep/v2"
@@ -123,6 +126,10 @@ func (s *SampleCaptureStreamer) analyzeAndStore() {
 	s.audioPlayer.sampleMutex.Unlock()
 }
 
+// errPlaySuperseded is returned by Play when a newer Play request arrived
+// while this one was waiting its turn; the caller should silently drop it.
+var errPlaySuperseded = errors.New("play request superseded")
+
 type AudioPlayer struct {
 	ctrl        *beep.Ctrl
 	mixer       *beep.Mixer
@@ -134,6 +141,14 @@ type AudioPlayer struct {
 	startTime   time.Time
 	pausedTime  time.Duration
 	duration    float64 // Total duration in seconds
+	// Play runs on background goroutines (loading can block on slow media);
+	// playMu serializes requests and playGen lets the newest one win.
+	playMu  sync.Mutex
+	playGen atomic.Int64
+	// closeCurrent closes the current track's decoder and source. Needed
+	// because the mixer-drain callback never fires for a track that is
+	// stopped or replaced mid-play.
+	closeCurrent func()
 	// Seeking (local files only; HTTP/radio streams aren't seekable)
 	streamer beep.StreamSeekCloser
 	seekable bool
@@ -176,6 +191,15 @@ func NewAudioPlayer() (*AudioPlayer, error) {
 }
 
 func (ap *AudioPlayer) Play(filePath string) error {
+	// Serialize concurrent Play calls; if a newer request arrived while this
+	// one waited for the lock, yield to it instead of fighting over the mixer.
+	gen := ap.playGen.Add(1)
+	ap.playMu.Lock()
+	defer ap.playMu.Unlock()
+	if gen != ap.playGen.Load() {
+		return errPlaySuperseded
+	}
+
 	// Check if it's a URL or local file
 	isURL := strings.HasPrefix(filePath, "http://") || strings.HasPrefix(filePath, "https://")
 	
@@ -193,23 +217,29 @@ func (ap *AudioPlayer) Play(filePath string) error {
 
 	// Stop any current playback
 	ap.Stop()
-	
+
 	// If it's a URL, try to play with fallback support
 	if isURL {
-		return ap.playWithFallback([]string{filePath})
+		return ap.playWithFallback([]string{filePath}, gen)
 	}
-	
+
 	// For local files, use the original logic
-	return ap.playDirectly(filePath)
+	return ap.playDirectly(filePath, gen)
+}
+
+// CancelPendingPlays invalidates any Play requests still waiting or loading,
+// so e.g. a stop can't be overtaken by a slow load finishing afterwards.
+func (ap *AudioPlayer) CancelPendingPlays() {
+	ap.playGen.Add(1)
 }
 
 // playWithFallback tries multiple URLs until one works
-func (ap *AudioPlayer) playWithFallback(urls []string) error {
+func (ap *AudioPlayer) playWithFallback(urls []string, gen int64) error {
 	var lastError error
-	
+
 	for i, url := range urls {
 		log.Printf("DEBUG: Trying URL %d/%d: %s", i+1, len(urls), url)
-		err := ap.playDirectly(url)
+		err := ap.playDirectly(url, gen)
 		if err == nil {
 			log.Printf("DEBUG: Successfully connected to URL %d: %s", i+1, url)
 			return nil
@@ -222,32 +252,8 @@ func (ap *AudioPlayer) playWithFallback(urls []string) error {
 	return fmt.Errorf("all stream URLs failed, last error: %w", lastError)
 }
 
-// PlayRadioStation plays a radio station with fallback support
-func (ap *AudioPlayer) PlayRadioStation(station *RadioStation) error {
-	if station == nil {
-		return fmt.Errorf("station is nil")
-	}
-	
-	log.Printf("DEBUG: Playing radio station: %s", station.Name)
-	
-	// Use StreamURLs if available, otherwise fall back to StreamURL
-	var urls []string
-	if len(station.StreamURLs) > 0 {
-		urls = station.StreamURLs
-		log.Printf("DEBUG: Using %d fallback URLs", len(urls))
-	} else if station.StreamURL != "" {
-		urls = []string{station.StreamURL}
-		log.Printf("DEBUG: Using single URL: %s", station.StreamURL)
-	} else {
-		urls = []string{station.URL}
-		log.Printf("DEBUG: Using original URL: %s", station.URL)
-	}
-	
-	return ap.playWithFallback(urls)
-}
-
 // playDirectly plays a single URL or file without fallback
-func (ap *AudioPlayer) playDirectly(filePath string) error {
+func (ap *AudioPlayer) playDirectly(filePath string, gen int64) error {
 	// Check if it's a URL or local file
 	isURL := strings.HasPrefix(filePath, "http://") || strings.HasPrefix(filePath, "https://")
 
@@ -262,6 +268,9 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 		client := &http.Client{
 			// No timeout for the client itself - streams need to be continuous
 			Transport: &http.Transport{
+				// Bound the TCP connect so a dead host can't wedge the play
+				// queue for the kernel's ~2min default.
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 				MaxIdleConns:          100,
 				MaxIdleConnsPerHost:   10,
 				IdleConnTimeout:       90 * time.Second,
@@ -392,6 +401,23 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	log.Printf("DEBUG: Setting up sample capture streamer")
 	sampleCapture := NewSampleCaptureStreamer(resampled, ap)
 
+	// Close the decoder and source exactly once, whether the track drains
+	// naturally (mixer callback) or is stopped/replaced mid-play (Stop).
+	var closeOnce sync.Once
+	cleanup := func() {
+		closeOnce.Do(func() {
+			streamer.Close()
+			reader.Close()
+		})
+	}
+
+	// A stop or newer play request arrived while we were loading; abandon
+	// quietly before touching the mixer.
+	if ap.playGen.Load() != gen {
+		cleanup()
+		return errPlaySuperseded
+	}
+
 	// Create a control wrapper for pause/resume
 	log.Printf("DEBUG: Setting up audio control")
 	ap.mutex.Lock()
@@ -404,6 +430,7 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	// Local files are seekable; live streams are not.
 	ap.streamer = streamer
 	ap.seekable = !isURL
+	ap.closeCurrent = cleanup
 	ap.mutex.Unlock()
 
 	// Wake the audio device (suspended while stopped/paused to save CPU).
@@ -421,8 +448,7 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 		ap.streamer = nil
 		ap.seekable = false
 		ap.mutex.Unlock()
-		streamer.Close()
-		reader.Close()
+		cleanup()
 	})))
 
 	log.Printf("DEBUG: Audio playback started successfully")
@@ -506,7 +532,14 @@ func (ap *AudioPlayer) Stop() {
 	speaker.Lock()
 	ap.mixer.Clear()
 	speaker.Unlock()
-	
+
+	// The mixer no longer references the track, so close its decoder and
+	// source now; the drain callback will never fire for it.
+	if ap.closeCurrent != nil {
+		ap.closeCurrent()
+		ap.closeCurrent = nil
+	}
+
 	ap.streamer = nil
 	ap.seekable = false
 	ap.isPlaying = false

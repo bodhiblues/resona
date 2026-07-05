@@ -289,24 +289,15 @@ func (rb *RadioBrowser) PlayQuickStation() (*RadioStation, error) {
 		name = "Quick Station"
 	}
 	
+	// Playlist URLs (.pls/.m3u) are resolved asynchronously at play time
+	// (startRadioCmd) so the HTTP fetch can't block the UI.
 	station := &RadioStation{
-		Name: name,
-		URL:  rb.quickURL,
+		Name:       name,
+		URL:        rb.quickURL,
+		StreamURL:  rb.quickURL,
+		StreamURLs: []string{rb.quickURL},
 	}
-	
-	// Resolve stream URL if it's a playlist
-	if strings.Contains(station.URL, ".pls") || strings.Contains(station.URL, ".m3u") {
-		streamURLs, err := resolvePlaylistURL(station.URL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve playlist URL: %w", err)
-		}
-		station.StreamURLs = streamURLs
-		station.StreamURL = streamURLs[0] // Set primary URL for backward compatibility
-	} else {
-		station.StreamURL = station.URL
-		station.StreamURLs = []string{station.URL} // Single URL as array
-	}
-	
+
 	return station, nil
 }
 

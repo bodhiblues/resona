@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"image/color"
 	"os"
@@ -67,6 +68,48 @@ func startScanCmd(folders []string, mode, folder string, st *scanState) tea.Cmd 
 	}
 }
 
+// playStartedMsg reports the outcome of an asynchronous track or radio load.
+// Exactly one of song/station is set.
+type playStartedMsg struct {
+	song    *Song
+	station *RadioStation
+	err     error
+}
+
+// startPlayCmd opens, decodes, and starts the given song off the UI
+// goroutine — loading can block for seconds on cold or networked storage.
+func startPlayCmd(ap *AudioPlayer, song Song) tea.Cmd {
+	return func() tea.Msg {
+		err := ap.Play(song.FilePath)
+		if err == nil {
+			ap.SetDuration(song.DurationSecs)
+		}
+		return playStartedMsg{song: &song, err: err}
+	}
+}
+
+// startRadioCmd connects to the station's stream off the UI goroutine —
+// HTTP connects can block for many seconds.
+func startRadioCmd(ap *AudioPlayer, station *RadioStation) tea.Cmd {
+	return func() tea.Msg {
+		url := station.StreamURL
+		if url == "" {
+			url = station.URL
+		}
+		// Playlist wrappers (.pls/.m3u) need an HTTP fetch to resolve to the
+		// actual stream URL — done here so it can't block the UI either.
+		if strings.Contains(url, ".pls") || strings.Contains(url, ".m3u") {
+			streamURLs, err := resolvePlaylistURL(url)
+			if err != nil {
+				return playStartedMsg{station: station, err: fmt.Errorf("failed to resolve playlist URL: %w", err)}
+			}
+			url = streamURLs[0]
+		}
+		err := ap.Play(url)
+		return playStartedMsg{station: station, err: err}
+	}
+}
+
 type model struct {
 	currentView       string
 	width             int
@@ -87,6 +130,7 @@ type model struct {
 	nowPlayingFocused bool
 	controlSelected   int // 0=prev, 1=play/pause, 2=next, 3=stop
 	ticking           bool // whether the playback tick chain is armed
+	pendingLoads      int  // async track/stream loads in flight
 	// Search functionality
 	searchMode        bool
 	searchQuery       string
@@ -114,10 +158,9 @@ type model struct {
 	currentPlaylist   []Song
 	currentTrackIndex int
 	// Radio spinner and timer
-	spinner           spinner.Model
-	radioStartTime    time.Time
-	radioPausedTime   time.Duration
-	radioWasPaused    bool
+	spinner        spinner.Model
+	radioStartTime time.Time     // start of the current uninterrupted listening segment
+	radioElapsed   time.Duration // listening time accumulated before the current segment
 	// Visualizer
 	visualizer        barchart.Model
 	currentChartType  string // "unicode", "bars", "line", "wave", "sparkline", "heatmap"
@@ -234,6 +277,41 @@ func (m *model) maybeTick() tea.Cmd {
 	return tickCmd()
 }
 
+// startCurrentTrack dispatches an async load of the current playlist track.
+// Playing state is set when the playStartedMsg arrives.
+func (m *model) startCurrentTrack() tea.Cmd {
+	if m.currentTrackIndex < 0 || m.currentTrackIndex >= len(m.currentPlaylist) {
+		return nil
+	}
+	song := m.currentPlaylist[m.currentTrackIndex]
+	m.pendingLoads++
+	m.statusFlash = "Loading: " + song.Title + "…"
+	return startPlayCmd(m.audioPlayer, song)
+}
+
+func (m *model) startNextTrack() tea.Cmd {
+	if !m.hasNextTrack() {
+		return nil
+	}
+	m.currentTrackIndex++
+	return m.startCurrentTrack()
+}
+
+func (m *model) startPreviousTrack() tea.Cmd {
+	if !m.hasPreviousTrack() {
+		return nil
+	}
+	m.currentTrackIndex--
+	return m.startCurrentTrack()
+}
+
+// startRadioStation dispatches an async connection to the station.
+func (m *model) startRadioStation(station *RadioStation) tea.Cmd {
+	m.pendingLoads++
+	m.statusFlash = "Connecting: " + station.Name + "…"
+	return startRadioCmd(m.audioPlayer, station)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case spinner.TickMsg:
@@ -275,18 +353,52 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tickMsg:
-		// Check if current track has finished and auto-play next
-		if m.isTrackFinished() {
-			if m.playNextTrack() {
-				return m, tickCmd()
-			} else {
-				// No more tracks, stop playing
+	case playStartedMsg:
+		if m.pendingLoads > 0 {
+			m.pendingLoads--
+		}
+		if errors.Is(msg.err, errPlaySuperseded) {
+			// A newer load replaced this one; its own msg will arrive.
+			return m, nil
+		}
+		if msg.err != nil {
+			m.statusFlash = "Playback failed: " + msg.err.Error()
+			// Early rejections (e.g. unsupported format) leave the previous
+			// track running — only clear state if nothing is actually loaded.
+			if !m.audioPlayer.IsPlaying() && !m.audioPlayer.IsPaused() {
 				m.playing = ""
 				m.playingSong = nil
-				m.ticking = false
-				return m, nil
+				m.playingStation = nil
 			}
+			return m, nil
+		}
+		m.statusFlash = ""
+		m.radioStartTime = time.Now()
+		m.radioElapsed = 0
+		if msg.station != nil {
+			m.playing = msg.station.Name
+			m.playingSong = nil
+			m.playingStation = msg.station
+			return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
+		}
+		m.playing = msg.song.Title
+		m.playingSong = msg.song
+		m.playingStation = nil
+		return m, m.maybeTick()
+
+	case tickMsg:
+		// Auto-advance when the current track finishes. Skip the check while
+		// a load is in flight: between Stop and the new track reaching the
+		// mixer the player looks "finished" and would false-advance.
+		if m.pendingLoads == 0 && m.isTrackFinished() {
+			m.ticking = false
+			if cmd := m.startNextTrack(); cmd != nil {
+				return m, cmd
+			}
+			// No more tracks, stop playing
+			m.playing = ""
+			m.playingSong = nil
+			return m, nil
 		}
 
 		// Keep ticking only while audio is actually advancing: the loop drives
@@ -419,16 +531,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cycleSearchCategory(-1)
 				return m, nil
 			case "enter":
-				if m.playSelectedSearchResult() {
+				if cmd := m.playSelectedSearchResult(); cmd != nil {
 					m.closeSearch()
-					return m, m.maybeTick()
+					return m, cmd
 				}
 				return m, nil
 			case "ctrl+a":
 				// Play everything currently listed (e.g. all jazz sub-genres).
-				if m.playAllSearchResults() {
+				if cmd := m.playAllSearchResults(); cmd != nil {
 					m.closeSearch()
-					return m, m.maybeTick()
+					return m, cmd
 				}
 				return m, nil
 			case "up":
@@ -477,23 +589,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.activateControl()
 			} else {
 				// Normal play/pause toggle
+				wasPlaying := m.audioPlayer.IsPlaying()
 				wasPaused := m.audioPlayer.IsPaused()
 				m.audioPlayer.TogglePause()
-				
-				// Handle radio pause tracking
+
+				// Radio listening time: bank the finished segment on pause,
+				// start a new segment on resume (pauses don't count).
 				if m.playingStation != nil {
-					if wasPaused {
-						// Resuming from pause - update pause tracking
-						if m.radioWasPaused {
-							m.radioPausedTime += time.Since(m.radioStartTime)
-						}
+					if wasPlaying {
+						m.radioElapsed += time.Since(m.radioStartTime)
+					} else if wasPaused {
 						m.radioStartTime = time.Now()
-					} else {
-						// Pausing - mark as paused
-						m.radioWasPaused = true
 					}
 				}
-				
+
 				if m.audioPlayer.IsPlaying() {
 					// Re-arm the tick loop (and radio spinner) on resume.
 					if m.playingStation != nil {
@@ -516,38 +625,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Quick station saved, now play it
 					stations := m.radioBrowser.GetStations()
 					if len(stations) > 0 {
-						lastStation := &stations[len(stations)-1]
-						if err := m.audioPlayer.Play(lastStation.StreamURL); err == nil {
-							m.playing = lastStation.Name
-							m.playingSong = nil
-							m.playingStation = lastStation
-							return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
-						}
+						return m, m.startRadioStation(&stations[len(stations)-1])
 					}
 				}
 			} else {
+				m.audioPlayer.CancelPendingPlays()
 				m.audioPlayer.Stop()
 				m.playing = ""
 				m.playingSong = nil
 				m.playingStation = nil
 				m.radioStartTime = time.Time{}
-				m.radioPausedTime = 0
-				m.radioWasPaused = false
+				m.radioElapsed = 0
 				m.nowPlayingFocused = false
 			}
 			return m, nil
 		case "p":
 			if m.currentView == "radio" && m.radioBrowser.GetCurrentView() == "quickadd" {
 				if station, err := m.radioBrowser.PlayQuickStation(); err == nil {
-					if err := m.audioPlayer.Play(station.StreamURL); err == nil {
-						m.playing = station.Name
-						m.playingSong = nil
-						m.playingStation = station
-						m.radioStartTime = time.Now()
-						m.radioPausedTime = 0
-						m.radioWasPaused = false
-						return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
-					}
+					return m, m.startRadioStation(station)
 				}
 			} else if m.currentView == "library" && m.libraryBrowser.GetCategoryType() == "playlists" {
 				// Play the whole selected/open playlist.
@@ -557,9 +652,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if songs := m.playlistManager.SongsOf(name); len(songs) > 0 {
 					m.setPlaylist(songs, 0)
-					if m.playCurrentTrack() {
-						return m, m.maybeTick()
-					}
+					return m, m.startCurrentTrack()
 				}
 			}
 			return m, nil
@@ -1451,13 +1544,8 @@ func (m model) renderProgressBar(width int) string {
 			return lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Muted)).Render(displayStr)
 		}
 		
-		// Calculate listening time (accounting for pause time)
-		var listeningTime time.Duration
-		if m.radioWasPaused {
-			listeningTime = m.radioPausedTime + time.Since(m.radioStartTime)
-		} else {
-			listeningTime = time.Since(m.radioStartTime)
-		}
+		// Listening time: segments banked across pauses plus the current one.
+		listeningTime := m.radioElapsed + time.Since(m.radioStartTime)
 		timeStr := formatDurationFromSeconds(listeningTime.Seconds())
 		
 		// Create spinner and timer display
@@ -1647,9 +1735,7 @@ func (m model) enterLibrarySelection() (model, tea.Cmd) {
 		songIndex := m.findSongInPlaylist(playlist, song)
 		if songIndex >= 0 {
 			m.setPlaylist(playlist, songIndex)
-			if m.playCurrentTrack() {
-				return m, m.maybeTick()
-			}
+			return m, m.startCurrentTrack()
 		}
 	}
 	return m, nil
@@ -1762,28 +1848,22 @@ func (m model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 func (m model) activateControl() (model, tea.Cmd) {
 	switch m.controlSelected {
 	case 0: // Previous
-		if m.playPreviousTrack() {
-			return m, m.maybeTick()
-		}
-		return m, nil
+		return m, m.startPreviousTrack()
 	case 1: // Play/Pause
+		wasPlaying := m.audioPlayer.IsPlaying()
 		wasPaused := m.audioPlayer.IsPaused()
 		m.audioPlayer.TogglePause()
-		
-		// Handle radio pause tracking
+
+		// Radio listening time: bank the finished segment on pause,
+		// start a new segment on resume (pauses don't count).
 		if m.playingStation != nil {
-			if wasPaused {
-				// Resuming from pause - update pause tracking
-				if m.radioWasPaused {
-					m.radioPausedTime += time.Since(m.radioStartTime)
-				}
+			if wasPlaying {
+				m.radioElapsed += time.Since(m.radioStartTime)
+			} else if wasPaused {
 				m.radioStartTime = time.Now()
-			} else {
-				// Pausing - mark as paused
-				m.radioWasPaused = true
 			}
 		}
-		
+
 		if m.audioPlayer.IsPlaying() {
 			// Re-arm the tick loop (and radio spinner) on resume.
 			if m.playingStation != nil {
@@ -1793,18 +1873,15 @@ func (m model) activateControl() (model, tea.Cmd) {
 		}
 		return m, nil
 	case 2: // Next
-		if m.playNextTrack() {
-			return m, m.maybeTick()
-		}
-		return m, nil
+		return m, m.startNextTrack()
 	case 3: // Stop
+		m.audioPlayer.CancelPendingPlays()
 		m.audioPlayer.Stop()
 		m.playing = ""
 		m.playingSong = nil
 		m.playingStation = nil
 		m.radioStartTime = time.Time{}
-		m.radioPausedTime = 0
-		m.radioWasPaused = false
+		m.radioElapsed = 0
 		m.nowPlayingFocused = false
 		return m, nil
 	}
@@ -2525,40 +2602,6 @@ func (m *model) hasPreviousTrack() bool {
 	return m.currentTrackIndex > 0
 }
 
-func (m *model) playNextTrack() bool {
-	if m.hasNextTrack() {
-		m.currentTrackIndex++
-		return m.playCurrentTrack()
-	}
-	return false
-}
-
-func (m *model) playPreviousTrack() bool {
-	if m.hasPreviousTrack() {
-		m.currentTrackIndex--
-		return m.playCurrentTrack()
-	}
-	return false
-}
-
-func (m *model) playCurrentTrack() bool {
-	if m.currentTrackIndex >= 0 && m.currentTrackIndex < len(m.currentPlaylist) {
-		song := m.currentPlaylist[m.currentTrackIndex]
-		if err := m.audioPlayer.Play(song.FilePath); err == nil {
-			m.playing = song.Title
-			m.playingSong = &song
-			// Reset radio variables when switching to library playback
-			m.playingStation = nil
-			m.radioStartTime = time.Time{}
-			m.radioPausedTime = 0
-			m.radioWasPaused = false
-			m.audioPlayer.SetDuration(song.DurationSecs)
-			return true
-		}
-	}
-	return false
-}
-
 func (m *model) isTrackFinished() bool {
 	if m.playingSong == nil {
 		return false
@@ -2835,9 +2878,9 @@ func (m *model) cycleSearchCategory(dir int) {
 // playSelectedSearchResult builds a queue from the highlighted row and starts
 // playback. A song row queues the visible songs (starting at the selection); an
 // artist/album/genre row queues that whole group. Returns false if nothing plays.
-func (m *model) playSelectedSearchResult() bool {
+func (m *model) playSelectedSearchResult() tea.Cmd {
 	if m.searchSelected < 0 || m.searchSelected >= len(m.searchResults) {
-		return false
+		return nil
 	}
 	sel := m.searchResults[m.searchSelected]
 
@@ -2858,21 +2901,21 @@ func (m *model) playSelectedSearchResult() bool {
 	}
 
 	if len(queue) == 0 {
-		return false
+		return nil
 	}
 	m.setPlaylist(queue, start)
-	return m.playCurrentTrack()
+	return m.startCurrentTrack()
 }
 
 // playAllSearchResults queues every song across all current results (deduped by
 // file path, in listed order) and starts playing — the "play all shown" action.
-func (m *model) playAllSearchResults() bool {
+func (m *model) playAllSearchResults() tea.Cmd {
 	queue := m.shownSongs()
 	if len(queue) == 0 {
-		return false
+		return nil
 	}
 	m.setPlaylist(queue, 0)
-	return m.playCurrentTrack()
+	return m.startCurrentTrack()
 }
 
 // shownSongs is the deduped union (by FilePath, in listed order) of every song
@@ -3581,19 +3624,7 @@ func (m model) handleRadioEnter() (model, tea.Cmd) {
 	} else {
 		// Playing a radio station
 		if station := m.radioBrowser.EnterSelected(); station != nil {
-			playURL := station.StreamURL
-			if playURL == "" {
-				playURL = station.URL
-			}
-			if err := m.audioPlayer.Play(playURL); err == nil {
-				m.playing = station.Name
-				m.playingSong = nil
-				m.playingStation = station
-				m.radioStartTime = time.Now()
-				m.radioPausedTime = 0
-				m.radioWasPaused = false
-				return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
-			}
+			return m, m.startRadioStation(station)
 		}
 	}
 	return m, nil
