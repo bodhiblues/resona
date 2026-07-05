@@ -161,6 +161,12 @@ func NewAudioPlayer() (*AudioPlayer, error) {
 	mixer := &beep.Mixer{}
 	speaker.Play(mixer)
 
+	// Nothing is playing yet: suspend the audio device so its real-time
+	// thread isn't mixing silence. Play resumes it.
+	if err := speaker.Suspend(); err != nil {
+		log.Printf("DEBUG: speaker suspend failed: %v", err)
+	}
+
 	return &AudioPlayer{
 		mixer:       mixer,
 		isPlaying:   false,
@@ -374,9 +380,13 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	}
 	log.Printf("DEBUG: Audio decoding successful, format: %+v", format)
 
-	// Resample if necessary
-	log.Printf("DEBUG: Resampling from %v to 44100", format.SampleRate)
-	resampled := beep.Resample(4, format.SampleRate, beep.SampleRate(44100), streamer)
+	// Resample only when the source rate differs — beep.Resample interpolates
+	// even at a 1:1 ratio, which wastes CPU on already-44100Hz sources.
+	var resampled beep.Streamer = streamer
+	if format.SampleRate != beep.SampleRate(44100) {
+		log.Printf("DEBUG: Resampling from %v to 44100", format.SampleRate)
+		resampled = beep.Resample(4, format.SampleRate, beep.SampleRate(44100), streamer)
+	}
 
 	// Wrap with sample capture streamer for visualization
 	log.Printf("DEBUG: Setting up sample capture streamer")
@@ -395,6 +405,11 @@ func (ap *AudioPlayer) playDirectly(filePath string) error {
 	ap.streamer = streamer
 	ap.seekable = !isURL
 	ap.mutex.Unlock()
+
+	// Wake the audio device (suspended while stopped/paused to save CPU).
+	if err := speaker.Resume(); err != nil {
+		log.Printf("DEBUG: speaker resume failed: %v", err)
+	}
 
 	// Add to mixer with callback for cleanup
 	log.Printf("DEBUG: Adding to mixer")
@@ -427,6 +442,7 @@ func (ap *AudioPlayer) Pause() {
 		ap.pausedTime += elapsed
 		ap.startTime = time.Now() // Reset start time for next resume
 		speaker.Unlock()
+		speaker.Suspend() // idle the audio device while paused
 	}
 }
 
@@ -435,6 +451,7 @@ func (ap *AudioPlayer) Resume() {
 	defer ap.mutex.Unlock()
 
 	if ap.ctrl != nil && ap.isPlaying && ap.isPaused {
+		speaker.Resume() // wake the audio device before unpausing
 		speaker.Lock()
 		ap.ctrl.Paused = false
 		ap.isPaused = false
@@ -448,6 +465,9 @@ func (ap *AudioPlayer) TogglePause() {
 	defer ap.mutex.Unlock()
 
 	if ap.ctrl != nil && ap.isPlaying {
+		if ap.isPaused {
+			speaker.Resume() // wake the audio device before unpausing
+		}
 		speaker.Lock()
 		if ap.isPaused {
 			// Currently paused, resume
@@ -463,7 +483,11 @@ func (ap *AudioPlayer) TogglePause() {
 			ap.pausedTime += elapsed
 			ap.startTime = time.Now() // Reset start time for next resume
 		}
+		nowPaused := ap.isPaused
 		speaker.Unlock()
+		if nowPaused {
+			speaker.Suspend() // idle the audio device while paused
+		}
 	}
 }
 
@@ -488,6 +512,9 @@ func (ap *AudioPlayer) Stop() {
 	ap.isPlaying = false
 	ap.isPaused = false
 	ap.currentSong = ""
+
+	// Idle the audio device while stopped; Play resumes it.
+	speaker.Suspend()
 }
 
 func (ap *AudioPlayer) IsPlaying() bool {

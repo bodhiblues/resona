@@ -86,6 +86,7 @@ type model struct {
 	settingsBrowser   *SettingsBrowser
 	nowPlayingFocused bool
 	controlSelected   int // 0=prev, 1=play/pause, 2=next, 3=stop
+	ticking           bool // whether the playback tick chain is armed
 	// Search functionality
 	searchMode        bool
 	searchQuery       string
@@ -215,12 +216,32 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), m.spinner.Tick)
+	// Nothing is playing or scanning at startup, so no timers run yet: the
+	// playback tick is armed via maybeTick when playback starts, and the
+	// spinner tick when a scan or radio stream starts.
+	return nil
+}
+
+// maybeTick arms the shared playback tick loop unless it is already running.
+// Handlers that start or resume playback must use this instead of tickCmd so
+// tick chains never accumulate — each chain re-arms itself from the tickMsg
+// handler, so returning a second tickCmd would double the tick rate forever.
+func (m *model) maybeTick() tea.Cmd {
+	if m.ticking {
+		return nil
+	}
+	m.ticking = true
+	return tickCmd()
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case spinner.TickMsg:
+		// The spinner is only shown while scanning or streaming radio; stop
+		// re-arming it otherwise so an idle app isn't re-rendered 10x/second.
+		if !m.scanning && (m.playingStation == nil || !m.audioPlayer.IsPlaying()) {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
@@ -263,15 +284,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// No more tracks, stop playing
 				m.playing = ""
 				m.playingSong = nil
+				m.ticking = false
 				return m, nil
 			}
 		}
-		
-		// Continue ticking if there's a song loaded (playing or paused) or radio station playing
-		// This ensures we can detect when a track finishes and auto-advance, and keeps spinner/timer updated
-		if m.playingSong != nil || m.playingStation != nil {
+
+		// Keep ticking only while audio is actually advancing: the loop drives
+		// track-finish detection, the progress bar, the visualizer, and the
+		// radio timer. A paused track can't finish, so the chain dies on pause
+		// and the resume handlers re-arm it via maybeTick.
+		if (m.playingSong != nil || m.playingStation != nil) && m.audioPlayer.IsPlaying() {
 			return m, tickCmd()
 		}
+		m.ticking = false
 		return m, nil
 		
 	case tea.WindowSizeMsg:
@@ -396,14 +421,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if m.playSelectedSearchResult() {
 					m.closeSearch()
-					return m, tickCmd()
+					return m, m.maybeTick()
 				}
 				return m, nil
 			case "ctrl+a":
 				// Play everything currently listed (e.g. all jazz sub-genres).
 				if m.playAllSearchResults() {
 					m.closeSearch()
-					return m, tickCmd()
+					return m, m.maybeTick()
 				}
 				return m, nil
 			case "up":
@@ -470,7 +495,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				
 				if m.audioPlayer.IsPlaying() {
-					return m, tickCmd() // Start ticking when resuming
+					// Re-arm the tick loop (and radio spinner) on resume.
+					if m.playingStation != nil {
+						return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
+					}
+					return m, m.maybeTick()
 				}
 				return m, nil
 			}
@@ -492,7 +521,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.playing = lastStation.Name
 							m.playingSong = nil
 							m.playingStation = lastStation
-							return m, tickCmd()
+							return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
 						}
 					}
 				}
@@ -517,7 +546,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.radioStartTime = time.Now()
 						m.radioPausedTime = 0
 						m.radioWasPaused = false
-						return m, tickCmd()
+						return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
 					}
 				}
 			} else if m.currentView == "library" && m.libraryBrowser.GetCategoryType() == "playlists" {
@@ -529,7 +558,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if songs := m.playlistManager.SongsOf(name); len(songs) > 0 {
 					m.setPlaylist(songs, 0)
 					if m.playCurrentTrack() {
-						return m, tickCmd()
+						return m, m.maybeTick()
 					}
 				}
 			}
@@ -582,7 +611,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.scanPercent = 0
 						m.scanDone, m.scanTotal = 0, 0
 						m.scanLabel = "Adding folder: " + selected
-						return m, tea.Batch(startScanCmd([]string{selected}, "add", selected, m.scanState), scanTickCmd())
+						return m, tea.Batch(startScanCmd([]string{selected}, "add", selected, m.scanState), scanTickCmd(), m.spinner.Tick)
 					}
 				}
 			} else if m.currentView == "radio" {
@@ -602,7 +631,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scanPercent = 0
 					m.scanDone, m.scanTotal = 0, 0
 					m.scanLabel = "Rescanning library…"
-					return m, tea.Batch(startScanCmd(folders, "rescan", "", m.scanState), scanTickCmd())
+					return m, tea.Batch(startScanCmd(folders, "rescan", "", m.scanState), scanTickCmd(), m.spinner.Tick)
 				}
 			}
 			return m, nil
@@ -1619,7 +1648,7 @@ func (m model) enterLibrarySelection() (model, tea.Cmd) {
 		if songIndex >= 0 {
 			m.setPlaylist(playlist, songIndex)
 			if m.playCurrentTrack() {
-				return m, tickCmd()
+				return m, m.maybeTick()
 			}
 		}
 	}
@@ -1734,7 +1763,7 @@ func (m model) activateControl() (model, tea.Cmd) {
 	switch m.controlSelected {
 	case 0: // Previous
 		if m.playPreviousTrack() {
-			return m, tickCmd()
+			return m, m.maybeTick()
 		}
 		return m, nil
 	case 1: // Play/Pause
@@ -1756,12 +1785,16 @@ func (m model) activateControl() (model, tea.Cmd) {
 		}
 		
 		if m.audioPlayer.IsPlaying() {
-			return m, tickCmd()
+			// Re-arm the tick loop (and radio spinner) on resume.
+			if m.playingStation != nil {
+				return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
+			}
+			return m, m.maybeTick()
 		}
 		return m, nil
 	case 2: // Next
 		if m.playNextTrack() {
-			return m, tickCmd()
+			return m, m.maybeTick()
 		}
 		return m, nil
 	case 3: // Stop
@@ -3559,7 +3592,7 @@ func (m model) handleRadioEnter() (model, tea.Cmd) {
 				m.radioStartTime = time.Now()
 				m.radioPausedTime = 0
 				m.radioWasPaused = false
-				return m, tickCmd()
+				return m, tea.Batch(m.maybeTick(), m.spinner.Tick)
 			}
 		}
 	}
