@@ -130,6 +130,15 @@ func (s *SampleCaptureStreamer) analyzeAndStore() {
 // while this one was waiting its turn; the caller should silently drop it.
 var errPlaySuperseded = errors.New("play request superseded")
 
+// speakerDrainTime is how long the audio device keeps running after playback
+// goes silent (pause/stop) before it is suspended. Roughly 100ms of
+// already-mixed audio sits in the oto player and ALSA buffers at any moment;
+// suspending before it drains freezes that tail of the old track in the
+// device buffer, and it replays as a brief blip when the speaker is next
+// resumed for a new track. Once the mixer has gone silent, waiting this long
+// guarantees only silence remains buffered.
+const speakerDrainTime = 300 * time.Millisecond
+
 type AudioPlayer struct {
 	ctrl        *beep.Ctrl
 	mixer       *beep.Mixer
@@ -152,6 +161,11 @@ type AudioPlayer struct {
 	// Seeking (local files only; HTTP/radio streams aren't seekable)
 	streamer beep.StreamSeekCloser
 	seekable bool
+	// Deferred speaker suspension (see suspendSpeakerSoon): suspendGen
+	// invalidates pending suspends when the speaker is resumed. suspendMu
+	// guards suspendGen and serializes suspend/resume of the device.
+	suspendMu  sync.Mutex
+	suspendGen int64
 	// Audio visualization
 	audioSamples []float64
 	sampleMutex  sync.RWMutex
@@ -231,6 +245,41 @@ func (ap *AudioPlayer) Play(filePath string) error {
 // so e.g. a stop can't be overtaken by a slow load finishing afterwards.
 func (ap *AudioPlayer) CancelPendingPlays() {
 	ap.playGen.Add(1)
+}
+
+// suspendSpeakerSoon idles the audio device once the device-side buffers have
+// drained to silence. The caller must already have silenced the mixer (paused
+// ctrl or cleared mixer) so that after speakerDrainTime nothing but silence
+// remains buffered — suspending immediately instead would freeze the tail of
+// the old track in the device buffer and replay it on the next resume.
+func (ap *AudioPlayer) suspendSpeakerSoon() {
+	ap.suspendMu.Lock()
+	ap.suspendGen++
+	gen := ap.suspendGen
+	ap.suspendMu.Unlock()
+
+	go func() {
+		time.Sleep(speakerDrainTime)
+		ap.suspendMu.Lock()
+		defer ap.suspendMu.Unlock()
+		if ap.suspendGen != gen {
+			return // speaker was resumed in the meantime
+		}
+		if err := speaker.Suspend(); err != nil {
+			log.Printf("DEBUG: deferred speaker suspend failed: %v", err)
+		}
+	}()
+}
+
+// resumeSpeaker wakes the audio device and cancels any pending deferred
+// suspend so it can't fire right after playback starts.
+func (ap *AudioPlayer) resumeSpeaker() {
+	ap.suspendMu.Lock()
+	defer ap.suspendMu.Unlock()
+	ap.suspendGen++
+	if err := speaker.Resume(); err != nil {
+		log.Printf("DEBUG: speaker resume failed: %v", err)
+	}
 }
 
 // playWithFallback tries multiple URLs until one works
@@ -434,9 +483,7 @@ func (ap *AudioPlayer) playDirectly(filePath string, gen int64) error {
 	ap.mutex.Unlock()
 
 	// Wake the audio device (suspended while stopped/paused to save CPU).
-	if err := speaker.Resume(); err != nil {
-		log.Printf("DEBUG: speaker resume failed: %v", err)
-	}
+	ap.resumeSpeaker()
 
 	// Add to mixer with callback for cleanup
 	log.Printf("DEBUG: Adding to mixer")
@@ -468,7 +515,7 @@ func (ap *AudioPlayer) Pause() {
 		ap.pausedTime += elapsed
 		ap.startTime = time.Now() // Reset start time for next resume
 		speaker.Unlock()
-		speaker.Suspend() // idle the audio device while paused
+		ap.suspendSpeakerSoon() // idle the audio device once the buffered tail drains
 	}
 }
 
@@ -477,7 +524,7 @@ func (ap *AudioPlayer) Resume() {
 	defer ap.mutex.Unlock()
 
 	if ap.ctrl != nil && ap.isPlaying && ap.isPaused {
-		speaker.Resume() // wake the audio device before unpausing
+		ap.resumeSpeaker() // wake the audio device before unpausing
 		speaker.Lock()
 		ap.ctrl.Paused = false
 		ap.isPaused = false
@@ -492,7 +539,7 @@ func (ap *AudioPlayer) TogglePause() {
 
 	if ap.ctrl != nil && ap.isPlaying {
 		if ap.isPaused {
-			speaker.Resume() // wake the audio device before unpausing
+			ap.resumeSpeaker() // wake the audio device before unpausing
 		}
 		speaker.Lock()
 		if ap.isPaused {
@@ -512,7 +559,7 @@ func (ap *AudioPlayer) TogglePause() {
 		nowPaused := ap.isPaused
 		speaker.Unlock()
 		if nowPaused {
-			speaker.Suspend() // idle the audio device while paused
+			ap.suspendSpeakerSoon() // idle the audio device once the buffered tail drains
 		}
 	}
 }
@@ -546,8 +593,11 @@ func (ap *AudioPlayer) Stop() {
 	ap.isPaused = false
 	ap.currentSong = ""
 
-	// Idle the audio device while stopped; Play resumes it.
-	speaker.Suspend()
+	// Idle the audio device while stopped; Play resumes it. Deferred so the
+	// old track's buffered tail drains instead of being frozen in the device
+	// buffer (it would replay as a blip when the next track resumes the
+	// speaker).
+	ap.suspendSpeakerSoon()
 }
 
 func (ap *AudioPlayer) IsPlaying() bool {
