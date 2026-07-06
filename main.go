@@ -172,6 +172,11 @@ type model struct {
 	scanTotal    int
 	scanLabel    string
 	scanProgress progress.Model
+	// Terminal background color, queried at startup. The progress bar's
+	// partial boundary cell paints its background with a blend of this and
+	// the muted track color so the unfilled part of the cell matches the ░
+	// track instead of punching a hole through to the terminal background.
+	termBg RGB
 }
 
 
@@ -250,6 +255,9 @@ func initialModel() model {
 			lipgloss.Color(settingsManager.GetTheme().Primary),
 			lipgloss.Color(settingsManager.GetTheme().Secondary),
 		)),
+		// Assumed until the BackgroundColorMsg reply arrives; on terminals
+		// that never answer, black matches the common dark-terminal case.
+		termBg: RGB{0, 0, 0},
 	}
 	
 	// Reset viewport to ensure proper initial display
@@ -259,10 +267,12 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	// Nothing is playing or scanning at startup, so no timers run yet: the
-	// playback tick is armed via maybeTick when playback starts, and the
-	// spinner tick when a scan or radio stream starts.
-	return nil
+	// No timers run yet: the playback tick is armed via maybeTick when
+	// playback starts, and the spinner tick when a scan or radio stream
+	// starts. Only ask the terminal for its background color (answered via
+	// tea.BackgroundColorMsg) so the progress bar can tone-match its
+	// partial boundary cell.
+	return tea.RequestBackgroundColor
 }
 
 // maybeTick arms the shared playback tick loop unless it is already running.
@@ -411,6 +421,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ticking = false
 		return m, nil
 		
+	case tea.BackgroundColorMsg:
+		r, g, b, _ := msg.RGBA()
+		m.termBg = RGB{float64(r >> 8), float64(g >> 8), float64(b >> 8)}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1611,6 +1626,14 @@ func (m model) renderProgressBar(width int) string {
 	// Create background style using shaded characters
 	backgroundStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(theme.Muted))
+
+	// The boundary cell's partial block only paints its leading fraction; the
+	// rest of the cell shows the cell background. Paint that background the
+	// apparent color of a ░ track cell — muted at ░'s ~25% ink coverage over
+	// the terminal background — so the boundary blends into the track instead
+	// of punching a dark hole in it.
+	trackTone := blendColors(m.termBg, colorCodeToRGB(theme.Muted), 0.25)
+	trackToneColor := lipgloss.Color(rgbToHex(trackTone))
 	
 	// Build the progress bar
 	var barParts []string
@@ -1623,35 +1646,18 @@ func (m model) renderProgressBar(width int) string {
 				barParts = append(barParts, gradientStyles[len(gradientStyles)-1].Render("█"))
 			}
 		} else if i == actualFilledWidth && remainder > 0 {
-			// This character position has some virtual progress
-			// Use a partial character based on the remainder
-			var partialChar string
-			if remainder == 1 {
-				partialChar = "▏"
-			} else if remainder == 2 {
-				partialChar = "▎"
-			} else if remainder == 3 {
-				partialChar = "▍"
-			} else if remainder == 4 {
-				partialChar = "▌"
-			} else if remainder == 5 {
-				partialChar = "▋"
-			} else if remainder == 6 {
-				partialChar = "▊"
-			} else if remainder == 7 {
-				partialChar = "▉"
-			} else {
-				partialChar = "█"
-			}
-			
+			// This character position has some virtual progress; use the
+			// left-eighth block matching the remainder (1..7).
+			partialChar := []string{"", "▏", "▎", "▍", "▌", "▋", "▊", "▉"}[remainder]
+
 			var partialStyle lipgloss.Style
 			if i < len(gradientStyles) {
 				partialStyle = gradientStyles[i]
 			} else {
 				partialStyle = gradientStyles[len(gradientStyles)-1]
 			}
-			
-			barParts = append(barParts, partialStyle.Render(partialChar))
+
+			barParts = append(barParts, partialStyle.Background(trackToneColor).Render(partialChar))
 		} else {
 			// Background character
 			barParts = append(barParts, backgroundStyle.Render("░"))
