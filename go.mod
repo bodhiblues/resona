@@ -15,6 +15,7 @@ require (
 	github.com/jfreymuth/oggvorbis v1.0.5
 	github.com/lrstanley/bubblezone/v2 v2.0.0
 	github.com/mewkiz/flac v1.0.13
+	github.com/pion/opus v0.1.0
 	github.com/tcolgate/mp3 v0.0.0-20170426193717-e79c5a46d300
 )
 

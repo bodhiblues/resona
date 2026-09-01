@@ -56,6 +56,7 @@ func (fb *FolderBrowser) refreshEntries() error {
 		".wav":  true,
 		".m4a":  true,
 		".ogg":  true,
+		".opus": true,
 		".m3u":  true,  // Playlist files
 		".m3u8": true,  // Playlist files
 		".pls":  true,  // Playlist files

@@ -36,6 +36,7 @@ var supportedAudioExts = map[string]bool{
 	".flac": true,
 	".wav":  true,
 	".ogg":  true,
+	".opus": true,
 	// .m4a and .aac are not supported by the audio player
 }
 
@@ -185,6 +186,8 @@ func calculateDuration(filePath string) float64 {
 		return calculateM4ADuration(filePath)
 	case ".ogg":
 		return calculateOGGDuration(filePath)
+	case ".opus":
+		return calculateOpusDuration(filePath)
 	default:
 		return 0
 	}

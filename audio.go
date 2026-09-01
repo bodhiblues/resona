@@ -222,7 +222,7 @@ func (ap *AudioPlayer) Play(filePath string) error {
 	if !isURL {
 		ext := strings.ToLower(filepath.Ext(filePath))
 		if ext == ".aac" || ext == ".m4a" || ext == ".mp4" {
-			return fmt.Errorf("AAC/M4A format is not supported. Please use MP3, OGG, FLAC, or WAV files")
+			return fmt.Errorf("AAC/M4A format is not supported. Please use MP3, OGG, Opus, FLAC, or WAV files")
 		}
 		if !ap.isFileSupported(filePath) {
 			return fmt.Errorf("unsupported file format: %s", ext)
@@ -421,6 +421,8 @@ func (ap *AudioPlayer) playDirectly(filePath string, gen int64) error {
 			streamer, format, err = flac.Decode(reader)
 		case ".ogg":
 			streamer, format, err = vorbis.Decode(reader)
+		case ".opus":
+			streamer, format, err = decodeOpus(reader)
 		default:
 			reader.Close()
 			return fmt.Errorf("unsupported format: %s", ext)
@@ -634,7 +636,7 @@ func (ap *AudioPlayer) CurrentSong() string {
 
 func (ap *AudioPlayer) isFileSupported(filePath string) bool {
 	ext := strings.ToLower(filepath.Ext(filePath))
-	return ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".ogg"
+	return ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".ogg" || ext == ".opus"
 }
 
 
